@@ -33,9 +33,21 @@ src/agents/
     react/
       __init__.py
       graph.py       # ReactAgent
+      yaml/
+        prompts.yaml # default system prompt (same content as EVE ``system.yaml``)
+    simple/
+      __init__.py
+      graph.py       # SimpleChatAgent
+      yaml/
+        prompts.yaml   # shorter default prompt
 ```
 
 All imports inside `graphs/` are **relative** so this tree can be developed as its own repository.
+
+Each graph package ships ``yaml/prompts.yaml`` with a ``system_prompt`` field. The backend
+runner passes ``system_prompt=None`` to ``compile``; graphs call
+``AgentGraph.resolve_system_prompt`` so that file is used unless an explicit string is
+passed. An optional conversation-summary prefix is still prepended by the runner.
 
 ## Develop
 

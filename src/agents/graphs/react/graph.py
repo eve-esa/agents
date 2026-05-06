@@ -46,9 +46,13 @@ class ReactAgent(AgentGraph):
         tools: List[BaseTool],
         system_prompt: Optional[str],
         checkpointer: Any,
+        system_prompt_prefix: Optional[str] = None,
         max_tokens: int = _DEFAULT_MAX_TOKENS,
         **kwargs,
     ):
+        system_prompt = self.resolve_system_prompt(
+            system_prompt, prefix=system_prompt_prefix
+        )
         llm_with_tools = llm.bind_tools(tools) if tools else llm
 
         # ── agent node ─────────────────────────────────────────────────────

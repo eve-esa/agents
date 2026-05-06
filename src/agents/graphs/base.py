@@ -1,11 +1,13 @@
 """AgentGraph base class — the contract for pluggable agent graphs.
 
-Only depends on langchain-core + langgraph + standard library.
+Only depends on langchain-core + langgraph + PyYAML + standard library.
 No backend (src.*) imports. Safe to use in standalone scripts/notebooks.
 """
 
+import inspect
 import logging
 import time
+from pathlib import Path
 from typing import Any, List, Optional
 
 from langchain_core.language_models import BaseChatModel
@@ -70,10 +72,66 @@ class AgentGraph:
     Inherit and implement ``compile()``.  Use the helper methods for free
     node/tool latency tracking and error handling.
 
-    Only depends on langchain-core + langgraph.  No backend imports.
+    Default system text lives next to each graph in ``yaml/prompts.yaml`` (key
+    ``system_prompt``).  When ``compile`` receives ``system_prompt=None`` or
+    blank, subclasses call :meth:`resolve_system_prompt` to load it.
+
+    Only depends on langchain-core + langgraph + PyYAML.  No backend imports.
     """
 
     name: str = "base"
+
+    def _prompts_yaml_path(self) -> Path:
+        """``…/yaml/prompts.yaml`` beside the module that defines the concrete graph class."""
+        mod = inspect.getmodule(type(self))
+        if mod is None or not getattr(mod, "__file__", None):
+            raise RuntimeError(
+                f"Cannot locate prompts.yaml for {type(self).__qualname__}: "
+                "defining module has no __file__"
+            )
+        return Path(mod.__file__).resolve().parent / "yaml" / "prompts.yaml"
+
+    def _load_default_system_prompt_from_yaml(self) -> Optional[str]:
+        path = self._prompts_yaml_path()
+        if not path.is_file():
+            logger.warning(
+                "Missing prompts.yaml for graph %r (expected %s)",
+                type(self).__name__,
+                path,
+            )
+            return None
+        try:
+            import yaml
+
+            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.error("Failed to read %s: %s", path, exc, exc_info=True)
+            return None
+        if not isinstance(data, dict):
+            return None
+        raw = data.get("system_prompt")
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        return text or None
+
+    def resolve_system_prompt(
+        self,
+        explicit: Optional[str],
+        *,
+        prefix: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return system text: *explicit* if set, else ``yaml/prompts.yaml``; optional *prefix* first."""
+        if explicit is not None and str(explicit).strip():
+            body = str(explicit).strip()
+        else:
+            body = self._load_default_system_prompt_from_yaml()
+        pfx = str(prefix).strip() if prefix is not None else ""
+        if pfx:
+            if body:
+                return f"{pfx}{body}"
+            return pfx
+        return body
 
     def compile(
         self,
@@ -82,6 +140,7 @@ class AgentGraph:
         tools: List[BaseTool],
         system_prompt: Optional[str],
         checkpointer: Any,
+        system_prompt_prefix: Optional[str] = None,
     ) -> CompiledStateGraph:
         """Build and return the compiled StateGraph.  Override in subclass."""
         raise NotImplementedError

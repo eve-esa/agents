@@ -28,9 +28,13 @@ class SimpleChatAgent(AgentGraph):
         tools: List[BaseTool],
         system_prompt: Optional[str],
         checkpointer: Any,
+        system_prompt_prefix: Optional[str] = None,
         max_tokens: int = _DEFAULT_MAX_TOKENS,
         **kwargs,
     ):
+        system_prompt = self.resolve_system_prompt(
+            system_prompt, prefix=system_prompt_prefix
+        )
         # Deliberately ignore *tools* — this graph never binds or invokes tools.
 
         async def agent_fn(state: MessagesState):
