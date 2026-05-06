@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eve-esa-agents"
+version = "0.1.0"
+description = "Standalone LangGraph agent graphs for EVE / Pi School backends"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+# Keep upper bounds conservative so `pip install eve-esa-agents` into an app that
+# pins langgraph==1.0.x does not pull langgraph 1.1+ and a different langchain-core.
+dependencies = [
+    "langchain-core>=0.3,<2",
+    "langgraph>=1.0.5,<1.1",
+    "pydantic>=2,<3",
+    "tiktoken>=0.6,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/eve-esa/agents"
+Repository = "https://github.com/eve-esa/agents"
+
+[tool.setuptools.packages.find]
+where = ["src"]
