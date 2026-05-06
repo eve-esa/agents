@@ -16,8 +16,10 @@ pip install -e .
 
 Use in the backend via `AGENT_GRAPH_TYPE`:
 
-- Short name `react` (backend resolves the ReAct graph), or
-- Fully qualified: `agents.graphs.react.graph.ReactAgent`
+- Short name `react` — ReAct loop with tools (default).
+- Short name `simple` — single LLM node, **no tools** (good for smoke tests).
+- Fully qualified examples: `agents.graphs.react.graph.ReactAgent`,
+  `agents.graphs.simple.graph.SimpleChatAgent`.
 
 ## Layout
 

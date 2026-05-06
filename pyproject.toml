@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eve-esa-agents"
-version = "0.1.0"
+version = "0.2.0"
 description = "Standalone LangGraph agent graphs for EVE / Pi School backends"
 readme = "README.md"
 requires-python = ">=3.11"
