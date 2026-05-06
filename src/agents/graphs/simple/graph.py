@@ -27,11 +27,12 @@ class SimpleChatAgent(AgentGraph):
         llm,
         tools: List[BaseTool],
         checkpointer: Any,
-        conversation_prefix: Optional[str] = None,
+        history: Optional[List[Any]] = None,
+        summary: Optional[str] = None,
         max_tokens: int = _DEFAULT_MAX_TOKENS,
         **kwargs,
     ):
-        instruction = self.instruction_text(conversation_prefix=conversation_prefix)
+        instruction = self.instruction_text(history=history, summary=summary)
         # Deliberately ignore *tools* — this graph never binds or invokes tools.
 
         async def agent_fn(state: MessagesState):

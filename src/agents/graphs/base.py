@@ -65,16 +65,34 @@ class LatencyInterceptor:
 
 # ─── AgentGraph base class ────────────────────────────────────────────────────
 
+# Role labels used when serialising history turns to plain text.
+_ROLE_LABELS: Dict[str, str] = {
+    "human": "User",
+    "humanmessage": "User",
+    "user": "User",
+    "ai": "Assistant",
+    "aimessage": "Assistant",
+    "assistant": "Assistant",
+    "system": "System",
+    "systemmessage": "System",
+    "tool": "Tool",
+    "toolmessage": "Tool",
+}
+
 
 class AgentGraph:
     """Base class for pluggable agent graphs.
 
     At construction, :attr:`prompts` is filled from ``prompts.yaml`` next to the
-    concrete class's ``graph.py`` (same keys as in the file, typically a string
-    field ``system`` for the lead-in message).
+    concrete class's ``graph.py`` (keys from the file, typically ``system`` for the
+    lead-in instruction).
 
-    Inherit and implement ``compile()``.  Use the helper methods for free
-    node/tool latency tracking and error handling.
+    ``compile`` receives the raw **conversation history** (list of LangChain messages
+    or ``{"role": …, "content": …}`` dicts) and the optional **summary** string from
+    the backend.  The base :meth:`format_history` serialises them to a plain-text
+    prefix that is prepended to ``prompts["system"]`` inside :meth:`instruction_text`.
+    Subclasses can override :meth:`format_history` to change that serialisation (e.g.
+    keep messages as structured objects rather than text).
 
     Only depends on langchain-core + langgraph + PyYAML.  No backend imports.
 
@@ -88,6 +106,8 @@ class AgentGraph:
 
     def __init__(self) -> None:
         self.prompts = self._load_prompts_from_yaml()
+
+    # ── Prompts YAML ──────────────────────────────────────────────────────────
 
     def _prompts_yaml_path(self) -> Path:
         """``prompts.yaml`` in the same directory as the module defining the graph class."""
@@ -119,18 +139,91 @@ class AgentGraph:
             return {}
         return dict(data)
 
-    def instruction_text(self, *, conversation_prefix: Optional[str] = None) -> Optional[str]:
-        """Lead-in message: ``prompts['system']`` plus optional *conversation_prefix*."""
+    # ── History formatting ────────────────────────────────────────────────────
+
+    def format_history(
+        self,
+        history: List[Any],
+        summary: Optional[str],
+    ) -> Optional[str]:
+        """Serialise conversation history and summary to a plain-text prefix string.
+
+        The base implementation:
+
+        1. Emits ``"Previous conversation summary:\\n{summary}\\n"`` when *summary* is set.
+        2. Appends each message as ``"{Role}: {content}"`` lines.
+
+        Override in a subclass to use a different format (e.g. keep messages as
+        structured objects, or suppress the summary, etc.).
+
+        Returns ``None`` when both inputs are empty.
+        """
+        parts: List[str] = []
+
+        if summary and str(summary).strip():
+            parts.append(
+                f"Previous conversation summary:\n{summary.strip()}\n"
+                "Please continue the conversation using this summary as context."
+            )
+
+        if history:
+            turns: List[str] = []
+            for msg in history:
+                # LangChain message objects
+                if hasattr(msg, "content"):
+                    raw_role = type(msg).__name__
+                    content = msg.content
+                # plain dicts {"role": …, "content": …}
+                elif isinstance(msg, dict):
+                    raw_role = str(msg.get("role", "unknown"))
+                    content = msg.get("content", "")
+                else:
+                    raw_role = "unknown"
+                    content = str(msg)
+
+                if isinstance(content, list):
+                    # multi-part content (e.g. vision models)
+                    content = " ".join(
+                        c.get("text", "") if isinstance(c, dict) else str(c)
+                        for c in content
+                    )
+
+                label = _ROLE_LABELS.get(raw_role.lower(), raw_role.capitalize())
+                turns.append(f"{label}: {str(content).strip()}")
+
+            if turns:
+                parts.append("\n".join(turns))
+
+        if not parts:
+            return None
+        return "\n\n".join(parts)
+
+    # ── Instruction builder ───────────────────────────────────────────────────
+
+    def instruction_text(
+        self,
+        history: Optional[List[Any]] = None,
+        summary: Optional[str] = None,
+    ) -> Optional[str]:
+        """Build the full lead-in instruction: history prefix + ``prompts['system']``.
+
+        *history* and *summary* are serialised by :meth:`format_history` and
+        prepended to the YAML ``system`` value.  Either or both may be omitted.
+        """
         raw = self.prompts.get("system")
-        body = str(raw).strip() if raw is not None else None
-        if body == "":
+        body = str(raw).strip() if raw else None
+        if not body:
             body = None
-        pfx = str(conversation_prefix).strip() if conversation_prefix else ""
-        if pfx:
-            if body:
-                return f"{pfx}{body}"
-            return pfx or None
+
+        prefix = self.format_history(history or [], summary)
+
+        if prefix and body:
+            return f"{prefix}\n\n{body}"
+        if prefix:
+            return prefix
         return body
+
+    # ── Compile (override per subclass) ──────────────────────────────────────
 
     def compile(
         self,
@@ -138,12 +231,13 @@ class AgentGraph:
         llm: BaseChatModel,
         tools: List[BaseTool],
         checkpointer: Any,
-        conversation_prefix: Optional[str] = None,
+        history: Optional[List[Any]] = None,
+        summary: Optional[str] = None,
     ) -> CompiledStateGraph:
         """Build and return the compiled StateGraph.  Override in subclass."""
         raise NotImplementedError
 
-    # ── Helper: instrumented tools node ────────────────────────────────────────
+    # ── Helper: instrumented tools node ──────────────────────────────────────
 
     def make_tools_node(self, tools: List[BaseTool]):
         """Create a tools node with per-tool latency tracking and error handling.
@@ -187,7 +281,7 @@ class AgentGraph:
 
         return tools_node
 
-    # ── Helper: timed node wrapper ─────────────────────────────────────────────
+    # ── Helper: timed node wrapper ────────────────────────────────────────────
 
     def timed_node(self, node_name: str, fn):
         """Wrap any async node function with latency logging.

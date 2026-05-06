@@ -45,11 +45,12 @@ class ReactAgent(AgentGraph):
         llm,
         tools: List[BaseTool],
         checkpointer: Any,
-        conversation_prefix: Optional[str] = None,
+        history: Optional[List[Any]] = None,
+        summary: Optional[str] = None,
         max_tokens: int = _DEFAULT_MAX_TOKENS,
         **kwargs,
     ):
-        instruction = self.instruction_text(conversation_prefix=conversation_prefix)
+        instruction = self.instruction_text(history=history, summary=summary)
         llm_with_tools = llm.bind_tools(tools) if tools else llm
 
         # ── agent node ─────────────────────────────────────────────────────
