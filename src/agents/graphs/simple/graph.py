@@ -26,21 +26,18 @@ class SimpleChatAgent(AgentGraph):
         *,
         llm,
         tools: List[BaseTool],
-        system_prompt: Optional[str],
         checkpointer: Any,
-        system_prompt_prefix: Optional[str] = None,
+        conversation_prefix: Optional[str] = None,
         max_tokens: int = _DEFAULT_MAX_TOKENS,
         **kwargs,
     ):
-        system_prompt = self.resolve_system_prompt(
-            system_prompt, prefix=system_prompt_prefix
-        )
+        instruction = self.instruction_text(conversation_prefix=conversation_prefix)
         # Deliberately ignore *tools* — this graph never binds or invokes tools.
 
         async def agent_fn(state: MessagesState):
             messages = list(state["messages"])
-            if system_prompt:
-                messages = [SystemMessage(content=system_prompt)] + messages
+            if instruction:
+                messages = [SystemMessage(content=instruction)] + messages
 
             if trim_messages is not None:
                 messages = trim_messages(

@@ -8,7 +8,7 @@ import inspect
 import logging
 import time
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import ToolMessage
@@ -69,18 +69,25 @@ class LatencyInterceptor:
 class AgentGraph:
     """Base class for pluggable agent graphs.
 
+    At construction, :attr:`prompts` is filled from ``prompts.yaml`` next to the
+    concrete class's ``graph.py`` (same keys as in the file, typically a string
+    field ``system`` for the lead-in message).
+
     Inherit and implement ``compile()``.  Use the helper methods for free
     node/tool latency tracking and error handling.
 
-    Default system text lives next to each graph in ``prompts.yaml`` (same
-    directory as ``graph.py``; key ``system_prompt``).  When ``compile`` receives
-    ``system_prompt=None`` or blank, subclasses call :meth:`resolve_system_prompt`
-    to load it.
-
     Only depends on langchain-core + langgraph + PyYAML.  No backend imports.
+
+    Subclasses that override ``__init__`` must call ``super().__init__()`` so
+    :attr:`prompts` is populated.
     """
 
     name: str = "base"
+
+    prompts: Dict[str, Any]
+
+    def __init__(self) -> None:
+        self.prompts = self._load_prompts_from_yaml()
 
     def _prompts_yaml_path(self) -> Path:
         """``prompts.yaml`` in the same directory as the module defining the graph class."""
@@ -92,7 +99,7 @@ class AgentGraph:
             )
         return Path(mod.__file__).resolve().parent / "prompts.yaml"
 
-    def _load_default_system_prompt_from_yaml(self) -> Optional[str]:
+    def _load_prompts_from_yaml(self) -> Dict[str, Any]:
         path = self._prompts_yaml_path()
         if not path.is_file():
             logger.warning(
@@ -100,38 +107,29 @@ class AgentGraph:
                 type(self).__name__,
                 path,
             )
-            return None
+            return {}
         try:
             import yaml
 
             data = yaml.safe_load(path.read_text(encoding="utf-8"))
         except Exception as exc:
             logger.error("Failed to read %s: %s", path, exc, exc_info=True)
-            return None
+            return {}
         if not isinstance(data, dict):
-            return None
-        raw = data.get("system_prompt")
-        if raw is None:
-            return None
-        text = str(raw).strip()
-        return text or None
+            return {}
+        return dict(data)
 
-    def resolve_system_prompt(
-        self,
-        explicit: Optional[str],
-        *,
-        prefix: Optional[str] = None,
-    ) -> Optional[str]:
-        """Return system text: *explicit* if set, else ``prompts.yaml``; optional *prefix* first."""
-        if explicit is not None and str(explicit).strip():
-            body = str(explicit).strip()
-        else:
-            body = self._load_default_system_prompt_from_yaml()
-        pfx = str(prefix).strip() if prefix is not None else ""
+    def instruction_text(self, *, conversation_prefix: Optional[str] = None) -> Optional[str]:
+        """Lead-in message: ``prompts['system']`` plus optional *conversation_prefix*."""
+        raw = self.prompts.get("system")
+        body = str(raw).strip() if raw is not None else None
+        if body == "":
+            body = None
+        pfx = str(conversation_prefix).strip() if conversation_prefix else ""
         if pfx:
             if body:
                 return f"{pfx}{body}"
-            return pfx
+            return pfx or None
         return body
 
     def compile(
@@ -139,9 +137,8 @@ class AgentGraph:
         *,
         llm: BaseChatModel,
         tools: List[BaseTool],
-        system_prompt: Optional[str],
         checkpointer: Any,
-        system_prompt_prefix: Optional[str] = None,
+        conversation_prefix: Optional[str] = None,
     ) -> CompiledStateGraph:
         """Build and return the compiled StateGraph.  Override in subclass."""
         raise NotImplementedError
