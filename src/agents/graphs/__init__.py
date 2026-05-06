@@ -2,7 +2,7 @@
 
 Contains ``base`` (AgentGraph, LatencyInterceptor), ``utils``, and graph
 implementations in sub-packages (e.g. ``react/``). Each graph package may include
-``yaml/prompts.yaml`` (``system_prompt`` key) for default instructions.
+``prompts.yaml`` (``system_prompt`` key) next to ``graph.py`` for default instructions.
 
 All imports **inside** this directory use relative imports (``from ..base``,
 ``from .graph``, etc.) so this tree can live in its own repository.

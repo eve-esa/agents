@@ -72,9 +72,10 @@ class AgentGraph:
     Inherit and implement ``compile()``.  Use the helper methods for free
     node/tool latency tracking and error handling.
 
-    Default system text lives next to each graph in ``yaml/prompts.yaml`` (key
-    ``system_prompt``).  When ``compile`` receives ``system_prompt=None`` or
-    blank, subclasses call :meth:`resolve_system_prompt` to load it.
+    Default system text lives next to each graph in ``prompts.yaml`` (same
+    directory as ``graph.py``; key ``system_prompt``).  When ``compile`` receives
+    ``system_prompt=None`` or blank, subclasses call :meth:`resolve_system_prompt`
+    to load it.
 
     Only depends on langchain-core + langgraph + PyYAML.  No backend imports.
     """
@@ -82,14 +83,14 @@ class AgentGraph:
     name: str = "base"
 
     def _prompts_yaml_path(self) -> Path:
-        """``…/yaml/prompts.yaml`` beside the module that defines the concrete graph class."""
+        """``prompts.yaml`` in the same directory as the module defining the graph class."""
         mod = inspect.getmodule(type(self))
         if mod is None or not getattr(mod, "__file__", None):
             raise RuntimeError(
                 f"Cannot locate prompts.yaml for {type(self).__qualname__}: "
                 "defining module has no __file__"
             )
-        return Path(mod.__file__).resolve().parent / "yaml" / "prompts.yaml"
+        return Path(mod.__file__).resolve().parent / "prompts.yaml"
 
     def _load_default_system_prompt_from_yaml(self) -> Optional[str]:
         path = self._prompts_yaml_path()
@@ -121,7 +122,7 @@ class AgentGraph:
         *,
         prefix: Optional[str] = None,
     ) -> Optional[str]:
-        """Return system text: *explicit* if set, else ``yaml/prompts.yaml``; optional *prefix* first."""
+        """Return system text: *explicit* if set, else ``prompts.yaml``; optional *prefix* first."""
         if explicit is not None and str(explicit).strip():
             body = str(explicit).strip()
         else:

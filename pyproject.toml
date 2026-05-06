@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eve-esa-agents"
-version = "0.3.0"
+version = "0.3.1"
 description = "Standalone LangGraph agent graphs for EVE / Pi School backends"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,5 +27,5 @@ Repository = "https://github.com/eve-esa/agents"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"agents.graphs.react" = ["yaml/prompts.yaml"]
-"agents.graphs.simple" = ["yaml/prompts.yaml"]
+"agents.graphs.react" = ["prompts.yaml"]
+"agents.graphs.simple" = ["prompts.yaml"]
