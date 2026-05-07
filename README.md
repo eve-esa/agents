@@ -2,7 +2,7 @@
 
 Pip-installable **LangGraph** agent definitions used by the Pi School / EVE backend.
 
-The importable package name is **`agents`** (under `src/agents/`). After install:
+The importable package name is **`agents`** (top-level `agents/` folder). After install:
 
 ```bash
 # Prefer the same venv as your backend (install backend requirements first).
@@ -24,7 +24,7 @@ Use in the backend via `AGENT_GRAPH_TYPE`:
 ## Layout
 
 ```
-src/agents/
+agents/
   __init__.py
   graphs/
     __init__.py
@@ -44,8 +44,9 @@ All imports inside `graphs/` are **relative** so this tree can be developed as i
 
 Each graph ships ``prompts.yaml`` next to ``graph.py``. ``AgentGraph`` fills the ``prompts``
 dict from that file at init (typically a ``system`` string for the lead-in). ``compile``
-accepts optional ``conversation_prefix`` (e.g. conversation summary); ``instruction_text``
-prepends it to ``prompts['system']``.
+receives ``history`` (message list) and ``summary`` from the runner. The base
+``format_history`` serialises summary + turns to text, and ``instruction_text``
+prepends that to ``prompts['system']``.
 
 ## Develop
 
