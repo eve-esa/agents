@@ -8,7 +8,7 @@ import inspect
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NotRequired, Optional
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import ToolMessage
@@ -16,7 +16,15 @@ from langchain_core.tools import BaseTool
 from langgraph.graph import MessagesState
 from langgraph.graph.state import CompiledStateGraph
 
+from .policies import DEFAULT_LLM_IDLE_TIMEOUT, DEFAULT_LLM_RUN_TIMEOUT, TOOL_RETRY
+
 logger = logging.getLogger(__name__)
+
+
+class AgentMessagesState(MessagesState):
+    """Messages graph state with optional in-graph LLM fallback tracking."""
+
+    use_fallback_llm: NotRequired[bool]
 
 
 # ─── Standalone MCP interceptor (no backend dependencies) ─────────────────────
@@ -233,8 +241,20 @@ class AgentGraph:
         checkpointer: Any,
         history: Optional[List[Any]] = None,
         summary: Optional[str] = None,
+        fallback_llm: Optional[BaseChatModel] = None,
+        llm_run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
+        llm_idle_timeout: Optional[float] = DEFAULT_LLM_IDLE_TIMEOUT,
+        **kwargs: Any,
     ) -> CompiledStateGraph:
-        """Build and return the compiled StateGraph.  Override in subclass."""
+        """Build and return the compiled StateGraph.  Override in subclass.
+
+        *fallback_llm* — optional secondary model; on LLM node failure the graph
+        ``error_handler`` re-runs the node with this binding (see
+        :mod:`agents.graphs.policies`).
+
+        *llm_run_timeout* / *llm_idle_timeout* — per-attempt caps for LLM nodes
+        (``TimeoutPolicy``).  Pass ``None`` for both to disable timeouts.
+        """
         raise NotImplementedError
 
     # ── Helper: instrumented tools node ──────────────────────────────────────
@@ -244,7 +264,11 @@ class AgentGraph:
 
         Usage::
 
-            builder.add_node("tools", self.make_tools_node(tools))
+            builder.add_node(
+                "tools",
+                self.make_tools_node(tools),
+                retry_policy=TOOL_RETRY,
+            )
         """
         tool_map = {t.name: t for t in tools}
 

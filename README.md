@@ -48,6 +48,16 @@ receives ``history`` (message list) and ``summary`` from the runner. The base
 ``format_history`` serialises summary + turns to text, and ``instruction_text``
 prepends that to ``prompts['system']``.
 
+Fault tolerance (requires ``langgraph>=1.2``) is configured inside the graph:
+
+- **LLM nodes** — ``TimeoutPolicy`` (``llm_run_timeout`` / ``llm_idle_timeout``)
+  and an ``error_handler`` that re-runs the node with ``fallback_llm`` when the
+  backend supplies one.
+- **Tool nodes** — ``RetryPolicy`` for transient MCP/API failures.
+
+The backend should pass ``fallback_llm`` (a bound or raw chat model) and may
+override timeout kwargs when calling ``compile``.
+
 ## Develop
 
 ```bash
