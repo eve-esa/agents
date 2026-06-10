@@ -18,13 +18,39 @@ logger = logging.getLogger(__name__)
 DEFAULT_LLM_RUN_TIMEOUT = 120.0
 DEFAULT_LLM_IDLE_TIMEOUT = 30.0
 
-# Transient failures on external tool/MCP calls; not used on LLM nodes.
-TOOL_RETRY = RetryPolicy(
-    max_attempts=5,
-    initial_interval=1.0,
+
+def is_transient_llm_error(exc: BaseException) -> bool:
+    """Best-effort predicate: should this LLM-node failure be retried in-place?
+
+    Kept dependency-light (no ``httpx`` / ``openai`` imports) so this module
+    only depends on ``langgraph``: matches builtin transient types, common
+    provider error class names, transient HTTP status codes, and node timeouts.
+    """
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    name = type(exc).__name__
+    if name in (
+        "NodeTimeoutError",
+        "RateLimitError",
+        "APIConnectionError",
+        "APITimeoutError",
+        "ServiceUnavailableError",
+        "InternalServerError",
+    ):
+        return True
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status in (429, 502, 503, 504)
+
+
+# Retry the primary LLM in-place on transient failures before the
+# ``error_handler`` escalates to the fallback model.
+LLM_RETRY = RetryPolicy(
+    max_attempts=2,
+    initial_interval=0.5,
     backoff_factor=2.0,
-    max_interval=10.0,
+    max_interval=8.0,
     jitter=True,
+    retry_on=is_transient_llm_error,
 )
 
 
@@ -50,10 +76,10 @@ def make_llm_fallback_error_handler(
 ) -> Callable[[Any, NodeError], Command]:
     """Return an ``error_handler`` that re-runs *node* with the fallback model.
 
-    Fires when the LLM node fails and no ``retry_policy`` is configured on that
-    node (the ``TimeoutPolicy`` and any other exception go straight to the
-    handler).  If the fallback was already attempted on this run or no fallback
-    model was supplied, the original exception is re-raised.
+    Fires after the node's ``retry_policy`` (:data:`LLM_RETRY`) is exhausted, so
+    a transient blip retries the primary first and only persistent failures
+    escalate here.  If the fallback was already attempted on this run or no
+    fallback model was supplied, the original exception is re-raised.
     """
 
     def handler(state: Any, error: NodeError) -> Command:
@@ -77,8 +103,13 @@ def llm_node_add_kwargs(
     llm_run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
     llm_idle_timeout: Optional[float] = DEFAULT_LLM_IDLE_TIMEOUT,
 ) -> dict[str, Any]:
-    """``add_node`` keyword args for a fault-tolerant LLM node."""
+    """``add_node`` keyword args for a fault-tolerant LLM node.
+
+    Combines an in-place :data:`LLM_RETRY` for transient failures with the
+    fallback ``error_handler`` that fires once retries are exhausted.
+    """
     kwargs: dict[str, Any] = {
+        "retry_policy": LLM_RETRY,
         "error_handler": make_llm_fallback_error_handler(
             node=node,
             has_fallback=has_fallback,

@@ -16,7 +16,7 @@ from langchain_core.tools import BaseTool
 from langgraph.graph import MessagesState
 from langgraph.graph.state import CompiledStateGraph
 
-from .policies import DEFAULT_LLM_IDLE_TIMEOUT, DEFAULT_LLM_RUN_TIMEOUT, TOOL_RETRY
+from .policies import DEFAULT_LLM_IDLE_TIMEOUT, DEFAULT_LLM_RUN_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -262,13 +262,14 @@ class AgentGraph:
     def make_tools_node(self, tools: List[BaseTool]):
         """Create a tools node with per-tool latency tracking and error handling.
 
+        Tool failures are caught and returned as ``ToolMessage`` content so the
+        agent can recover within the ReAct loop.  Do **not** attach a node-level
+        ``retry_policy`` here: the node never re-raises (so it would never fire)
+        and a node-level retry would re-invoke every tool call in the turn.
+
         Usage::
 
-            builder.add_node(
-                "tools",
-                self.make_tools_node(tools),
-                retry_policy=TOOL_RETRY,
-            )
+            builder.add_node("tools", self.make_tools_node(tools))
         """
         tool_map = {t.name: t for t in tools}
 

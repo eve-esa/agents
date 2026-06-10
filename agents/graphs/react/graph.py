@@ -21,7 +21,6 @@ from ..base import AgentGraph, AgentMessagesState
 from ..policies import (
     DEFAULT_LLM_IDLE_TIMEOUT,
     DEFAULT_LLM_RUN_TIMEOUT,
-    TOOL_RETRY,
     llm_node_add_kwargs,
 )
 from ..utils import (
@@ -43,10 +42,11 @@ class ReactAgent(AgentGraph):
     that emit tool calls as text (Mistral/EVE-Instruct ``[TOOL_CALLS]`` format).
 
     Pass ``fallback_llm`` from the backend to enable in-graph model fallback.
-    The agent node uses a :class:`~langgraph.types.TimeoutPolicy`; on failure
-    (timeout or other error) an ``error_handler`` re-runs the node with the
-    fallback binding.  Tool nodes use :class:`~langgraph.types.RetryPolicy` for
-    transient external failures.
+    The agent node retries transient failures in-place (``LLM_RETRY``) and, once
+    exhausted, an ``error_handler`` re-runs the node with the fallback binding.
+    Tool failures are surfaced back to the agent as ``ToolMessage`` content so
+    the ReAct loop can recover, rather than retried at the node level (a
+    node-level retry would re-invoke every tool call in the turn).
     """
 
     name = "react"
@@ -150,11 +150,7 @@ class ReactAgent(AgentGraph):
                 llm_idle_timeout=llm_idle_timeout,
             ),
         )
-        builder.add_node(
-            "tools",
-            self.make_tools_node(tools),
-            retry_policy=TOOL_RETRY,
-        )
+        builder.add_node("tools", self.make_tools_node(tools))
         builder.add_edge(START, "agent")
         builder.add_conditional_edges(
             "agent", should_continue, {"tools": "tools", END: END}
