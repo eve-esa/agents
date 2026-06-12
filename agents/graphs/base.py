@@ -8,7 +8,7 @@ import inspect
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List, NotRequired, Optional
+from typing import Any, Dict, List, Optional
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import ToolMessage
@@ -22,9 +22,20 @@ logger = logging.getLogger(__name__)
 
 
 class AgentMessagesState(MessagesState):
-    """Messages graph state with optional in-graph LLM fallback tracking."""
+    """Messages graph state for pluggable agent graphs.
 
-    use_fallback_llm: NotRequired[bool]
+    Extends :class:`~langgraph.graph.MessagesState` (which provides the
+    ``messages`` list) with no additional fields by default.  Kept as an
+    explicit subclass so that:
+
+    - All node functions share a single type annotation that can be
+      extended in-place without touching every ``add_node`` call.
+    - Future per-graph state fields (e.g. retrieved-doc metadata, turn
+      counters) can be added here rather than requiring a new class.
+
+    Recovery routing is structural (via the ``agent_fallback`` node) rather
+    than flag-based, so no ``use_fallback_llm`` field is needed in state.
+    """
 
 
 # ─── Standalone MCP interceptor (no backend dependencies) ─────────────────────

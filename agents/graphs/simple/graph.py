@@ -14,6 +14,8 @@ from ..base import AgentGraph, AgentMessagesState
 from ..policies import (
     DEFAULT_LLM_IDLE_TIMEOUT,
     DEFAULT_LLM_RUN_TIMEOUT,
+    LLM_RETRY,
+    build_llm_timeout_policy,
     llm_node_add_kwargs,
 )
 from ..utils import tiktoken_counter
@@ -22,7 +24,14 @@ _DEFAULT_MAX_TOKENS = 16_384
 
 
 class SimpleChatAgent(AgentGraph):
-    """MessagesState graph: ``START -> agent -> END`` (no tool node)."""
+    """MessagesState graph: ``START -> agent -> END`` (no tool node).
+
+    Pass ``fallback_llm`` to enable in-graph model fallback.  The primary
+    ``agent`` node retries transient failures in-place (``LLM_RETRY``) and,
+    once retries are exhausted, an ``error_handler`` routes to a dedicated
+    ``agent_fallback`` node that runs the fallback model.  Failures on
+    ``agent_fallback`` bubble up unhandled.
+    """
 
     name = "simple"
 
@@ -44,11 +53,10 @@ class SimpleChatAgent(AgentGraph):
         has_fallback = fallback_llm is not None
         # Deliberately ignore *tools* — this graph never binds or invokes tools.
 
-        async def agent_fn(state: AgentMessagesState):
+        def _build_messages(state: AgentMessagesState):
             messages = list(state["messages"])
             if instruction:
                 messages = [SystemMessage(content=instruction)] + messages
-
             if trim_messages is not None:
                 messages = trim_messages(
                     messages,
@@ -59,23 +67,22 @@ class SimpleChatAgent(AgentGraph):
                     start_on="human",
                     end_on=("human", "tool"),
                 )
+            return messages
 
-            llm_to_use = (
-                fallback_llm
-                if state.get("use_fallback_llm") and fallback_llm is not None
-                else llm
-            )
-            # A successful attempt clears the fallback flag so it scopes to the
-            # failed attempt's retry rather than pinning the thread to fallback.
-            response = await llm_to_use.ainvoke(messages)
-            return {"messages": [response], "use_fallback_llm": False}
+        async def agent_fn(state: AgentMessagesState):
+            response = await llm.ainvoke(_build_messages(state))
+            return {"messages": [response]}
+
+        async def agent_fallback_fn(state: AgentMessagesState):
+            response = await fallback_llm.ainvoke(_build_messages(state))
+            return {"messages": [response]}
 
         builder = StateGraph(AgentMessagesState)
         builder.add_node(
             "agent",
             self.timed_node("agent", agent_fn),
             **llm_node_add_kwargs(
-                node="agent",
+                fallback_node="agent_fallback",
                 has_fallback=has_fallback,
                 llm_run_timeout=llm_run_timeout,
                 llm_idle_timeout=llm_idle_timeout,
@@ -83,4 +90,19 @@ class SimpleChatAgent(AgentGraph):
         )
         builder.add_edge(START, "agent")
         builder.add_edge("agent", END)
+
+        if has_fallback:
+            fallback_node_kwargs: dict[str, Any] = {"retry_policy": LLM_RETRY}
+            timeout = build_llm_timeout_policy(
+                run_timeout=llm_run_timeout, idle_timeout=llm_idle_timeout
+            )
+            if timeout is not None:
+                fallback_node_kwargs["timeout"] = timeout
+            builder.add_node(
+                "agent_fallback",
+                self.timed_node("agent_fallback", agent_fallback_fn),
+                **fallback_node_kwargs,
+            )
+            builder.add_edge("agent_fallback", END)
+
         return builder.compile(checkpointer=checkpointer)

@@ -70,48 +70,51 @@ def build_llm_timeout_policy(
 
 def make_llm_fallback_error_handler(
     *,
-    node: str,
+    fallback_node: str,
     has_fallback: bool,
     log: logging.Logger = logger,
 ) -> Callable[[Any, NodeError], Command]:
-    """Return an ``error_handler`` that re-runs *node* with the fallback model.
+    """Return an ``error_handler`` that routes to *fallback_node* on exhausted retries.
 
     Fires after the node's ``retry_policy`` (:data:`LLM_RETRY`) is exhausted, so
-    a transient blip retries the primary first and only persistent failures
-    escalate here.  If the fallback was already attempted on this run or no
-    fallback model was supplied, the original exception is re-raised.
+    transient blips retry in-place first and only persistent failures escalate
+    here.  If no fallback model was supplied, the original exception is re-raised.
+
+    Uses LangGraph's canonical recovery-node pattern: ``Command(goto=fallback_node)``
+    routes to a dedicated separate node rather than looping back to the failing node.
     """
 
     def handler(state: Any, error: NodeError) -> Command:
-        if not has_fallback or state.get("use_fallback_llm"):
+        if not has_fallback:
             raise error.error
         log.warning(
-            "Node %s failed (%s: %s), retrying with fallback model",
+            "Node %s failed (%s: %s), routing to fallback node %r",
             error.node,
             type(error.error).__name__,
             error.error,
+            fallback_node,
         )
-        return Command(update={"use_fallback_llm": True}, goto=node)
+        return Command(goto=fallback_node)
 
     return handler
 
 
 def llm_node_add_kwargs(
     *,
-    node: str,
+    fallback_node: str,
     has_fallback: bool,
     llm_run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
     llm_idle_timeout: Optional[float] = DEFAULT_LLM_IDLE_TIMEOUT,
 ) -> dict[str, Any]:
     """``add_node`` keyword args for a fault-tolerant LLM node.
 
-    Combines an in-place :data:`LLM_RETRY` for transient failures with the
-    fallback ``error_handler`` that fires once retries are exhausted.
+    Combines an in-place :data:`LLM_RETRY` for transient failures with an
+    ``error_handler`` that routes to *fallback_node* once retries are exhausted.
     """
     kwargs: dict[str, Any] = {
         "retry_policy": LLM_RETRY,
         "error_handler": make_llm_fallback_error_handler(
-            node=node,
+            fallback_node=fallback_node,
             has_fallback=has_fallback,
         ),
     }
