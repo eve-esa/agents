@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 # Default LLM attempt caps — backends can override via ``compile(llm_run_timeout=…)``.
 DEFAULT_LLM_RUN_TIMEOUT = 120.0
 DEFAULT_LLM_IDLE_TIMEOUT = 30.0
+FALLBACK_LLM_TIMEOUT_MULTIPLIER = 1.5
 
 
 def is_transient_llm_error(exc: BaseException) -> bool:
@@ -66,6 +67,28 @@ def build_llm_timeout_policy(
     if run_timeout is None and idle_timeout is None:
         return None
     return TimeoutPolicy(run_timeout=run_timeout, idle_timeout=idle_timeout)
+
+
+def build_llm_fallback_timeout_policy(
+    *,
+    run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
+    idle_timeout: Optional[float] = DEFAULT_LLM_IDLE_TIMEOUT,
+) -> Optional[TimeoutPolicy]:
+    """Build a :class:`TimeoutPolicy` for a fallback LLM node (1.5× primary caps)."""
+    scaled_run = (
+        run_timeout * FALLBACK_LLM_TIMEOUT_MULTIPLIER
+        if run_timeout is not None
+        else None
+    )
+    scaled_idle = (
+        idle_timeout * FALLBACK_LLM_TIMEOUT_MULTIPLIER
+        if idle_timeout is not None
+        else None
+    )
+    return build_llm_timeout_policy(
+        run_timeout=scaled_run,
+        idle_timeout=scaled_idle,
+    )
 
 
 def make_llm_fallback_error_handler(
