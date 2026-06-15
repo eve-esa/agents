@@ -66,6 +66,7 @@ class ReactAgent(AgentGraph):
         fallback_llm=None,
         llm_run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
         llm_idle_timeout: Optional[float] = DEFAULT_LLM_IDLE_TIMEOUT,
+        streaming: bool = True,
         **kwargs,
     ):
         instruction = self.instruction_text(history=history, summary=summary)
@@ -76,6 +77,7 @@ class ReactAgent(AgentGraph):
             else fallback_llm
         )
         has_fallback = fallback_llm_bound is not None
+        node_idle_timeout = llm_idle_timeout if streaming else None
 
         # shared invocation logic
         async def _invoke(state: AgentMessagesState, llm_bound):
@@ -108,7 +110,15 @@ class ReactAgent(AgentGraph):
             if has_synthetic:
                 messages = reformat_messages_for_text_tool_model(messages)
 
-            response = await llm_bound.ainvoke(messages)
+            if streaming:
+                response = None
+                async for chunk in llm_bound.astream(messages):
+                    if response is None:
+                        response = chunk
+                    else:
+                        response = response + chunk
+            else:
+                response = await llm_bound.ainvoke(messages)
 
             if not getattr(response, "tool_calls", None) and isinstance(
                 response.content, str
@@ -151,7 +161,7 @@ class ReactAgent(AgentGraph):
                 fallback_node="agent_fallback",
                 has_fallback=has_fallback,
                 llm_run_timeout=llm_run_timeout,
-                llm_idle_timeout=llm_idle_timeout,
+                llm_idle_timeout=node_idle_timeout,
             ),
         )
         builder.add_node("tools", self.make_tools_node(tools))
@@ -164,7 +174,7 @@ class ReactAgent(AgentGraph):
         if has_fallback:
             fallback_node_kwargs: dict[str, Any] = {"retry_policy": LLM_RETRY}
             timeout = build_llm_timeout_policy(
-                run_timeout=llm_run_timeout, idle_timeout=llm_idle_timeout
+                run_timeout=llm_run_timeout, idle_timeout=node_idle_timeout
             )
             if timeout is not None:
                 fallback_node_kwargs["timeout"] = timeout

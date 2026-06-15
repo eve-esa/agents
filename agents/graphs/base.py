@@ -255,6 +255,7 @@ class AgentGraph:
         fallback_llm: Optional[BaseChatModel] = None,
         llm_run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
         llm_idle_timeout: Optional[float] = DEFAULT_LLM_IDLE_TIMEOUT,
+        streaming: bool = True,
         **kwargs: Any,
     ) -> CompiledStateGraph:
         """Build and return the compiled StateGraph.  Override in subclass.
@@ -265,6 +266,8 @@ class AgentGraph:
 
         *llm_run_timeout* / *llm_idle_timeout* — per-attempt caps for LLM nodes
         (``TimeoutPolicy``).  Pass ``None`` for both to disable timeouts.
+        ``llm_idle_timeout`` applies only when *streaming* is ``True``; non-streaming
+        graphs rely on ``llm_run_timeout`` alone.
         """
         raise NotImplementedError
 
