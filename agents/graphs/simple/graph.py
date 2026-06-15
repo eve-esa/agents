@@ -47,12 +47,10 @@ class SimpleChatAgent(AgentGraph):
         fallback_llm=None,
         llm_run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
         llm_idle_timeout: Optional[float] = DEFAULT_LLM_IDLE_TIMEOUT,
-        streaming: bool = True,
         **kwargs,
     ):
         instruction = self.instruction_text(history=history, summary=summary)
         has_fallback = fallback_llm is not None
-        node_idle_timeout = llm_idle_timeout if streaming else None
         # Deliberately ignore *tools* — this graph never binds or invokes tools.
 
         def _build_messages(state: AgentMessagesState):
@@ -73,15 +71,7 @@ class SimpleChatAgent(AgentGraph):
 
         async def _invoke(state: AgentMessagesState, llm_client):
             messages = _build_messages(state)
-            if streaming:
-                response = None
-                async for chunk in llm_client.astream(messages):
-                    if response is None:
-                        response = chunk
-                    else:
-                        response = response + chunk
-            else:
-                response = await llm_client.ainvoke(messages)
+            response = await llm_client.ainvoke(messages)
             return {"messages": [response]}
 
         async def agent_fn(state: AgentMessagesState):
@@ -98,7 +88,7 @@ class SimpleChatAgent(AgentGraph):
                 fallback_node="agent_fallback",
                 has_fallback=has_fallback,
                 llm_run_timeout=llm_run_timeout,
-                llm_idle_timeout=node_idle_timeout,
+                llm_idle_timeout=llm_idle_timeout,
             ),
         )
         builder.add_edge(START, "agent")
@@ -107,7 +97,7 @@ class SimpleChatAgent(AgentGraph):
         if has_fallback:
             fallback_node_kwargs: dict[str, Any] = {"retry_policy": LLM_RETRY}
             timeout = build_llm_timeout_policy(
-                run_timeout=llm_run_timeout, idle_timeout=node_idle_timeout
+                run_timeout=llm_run_timeout, idle_timeout=llm_idle_timeout
             )
             if timeout is not None:
                 fallback_node_kwargs["timeout"] = timeout
