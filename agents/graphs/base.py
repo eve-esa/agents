@@ -16,7 +16,26 @@ from langchain_core.tools import BaseTool
 from langgraph.graph import MessagesState
 from langgraph.graph.state import CompiledStateGraph
 
+from .policies import DEFAULT_LLM_IDLE_TIMEOUT, DEFAULT_LLM_RUN_TIMEOUT
+
 logger = logging.getLogger(__name__)
+
+
+class AgentMessagesState(MessagesState):
+    """Messages graph state for pluggable agent graphs.
+
+    Extends :class:`~langgraph.graph.MessagesState` (which provides the
+    ``messages`` list) with no additional fields by default.  Kept as an
+    explicit subclass so that:
+
+    - All node functions share a single type annotation that can be
+      extended in-place without touching every ``add_node`` call.
+    - Future per-graph state fields (e.g. retrieved-doc metadata, turn
+      counters) can be added here rather than requiring a new class.
+
+    Recovery routing is structural (via the ``agent_fallback`` node) rather
+    than flag-based, so no ``use_fallback_llm`` field is needed in state.
+    """
 
 
 # ─── Standalone MCP interceptor (no backend dependencies) ─────────────────────
@@ -233,14 +252,31 @@ class AgentGraph:
         checkpointer: Any,
         history: Optional[List[Any]] = None,
         summary: Optional[str] = None,
+        fallback_llm: Optional[BaseChatModel] = None,
+        llm_run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
+        llm_idle_timeout: Optional[float] = DEFAULT_LLM_IDLE_TIMEOUT,
+        **kwargs: Any,
     ) -> CompiledStateGraph:
-        """Build and return the compiled StateGraph.  Override in subclass."""
+        """Build and return the compiled StateGraph.  Override in subclass.
+
+        *fallback_llm* — optional secondary model; on LLM node failure the graph
+        ``error_handler`` re-runs the node with this binding (see
+        :mod:`agents.graphs.policies`).
+
+        *llm_run_timeout* / *llm_idle_timeout* — per-attempt caps for LLM nodes
+        (``TimeoutPolicy``).  Pass ``None`` for both to disable timeouts.
+        """
         raise NotImplementedError
 
     # ── Helper: instrumented tools node ──────────────────────────────────────
 
     def make_tools_node(self, tools: List[BaseTool]):
         """Create a tools node with per-tool latency tracking and error handling.
+
+        Tool failures are caught and returned as ``ToolMessage`` content so the
+        agent can recover within the ReAct loop.  Do **not** attach a node-level
+        ``retry_policy`` here: the node never re-raises (so it would never fire)
+        and a node-level retry would re-invoke every tool call in the turn.
 
         Usage::
 

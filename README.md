@@ -48,6 +48,25 @@ receives ``history`` (message list) and ``summary`` from the runner. The base
 ``format_history`` serialises summary + turns to text, and ``instruction_text``
 prepends that to ``prompts['system']``.
 
+Fault tolerance (requires ``langgraph>=1.2``) is configured inside the graph:
+
+- **LLM nodes** — ``TimeoutPolicy`` (``llm_run_timeout`` / ``llm_idle_timeout``),
+  an in-place ``RetryPolicy`` (``LLM_RETRY``) for transient failures, and an
+  ``error_handler`` that routes to a dedicated ``agent_fallback`` recovery node
+  once retries are exhausted.  This follows LangGraph's canonical recovery-node
+  pattern: the handler returns ``Command(goto="agent_fallback")`` to a separate
+  node rather than looping back to the failing node.  The ``agent_fallback`` node
+  runs the same logic with ``fallback_llm`` and itself has ``LLM_RETRY`` for
+  transient failures; unhandled failures on ``agent_fallback`` bubble up.  The
+  ``agent_fallback`` node is registered only when the backend supplies
+  ``fallback_llm`` to ``compile``.
+- **Tool nodes** — failures are returned to the agent as ``ToolMessage`` content
+  so the ReAct loop can recover (no node-level retry, which would re-invoke
+  every tool call in the turn).
+
+The backend should pass ``fallback_llm`` (a bound or raw chat model) and may
+override timeout kwargs when calling ``compile``.
+
 ## Develop
 
 ```bash
