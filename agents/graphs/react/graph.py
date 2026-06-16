@@ -22,7 +22,7 @@ from ..policies import (
     DEFAULT_LLM_IDLE_TIMEOUT,
     DEFAULT_LLM_RUN_TIMEOUT,
     LLM_RETRY,
-    build_llm_timeout_policy,
+    build_llm_fallback_timeout_policy,
     llm_node_add_kwargs,
 )
 from ..utils import (
@@ -163,7 +163,7 @@ class ReactAgent(AgentGraph):
 
         if has_fallback:
             fallback_node_kwargs: dict[str, Any] = {"retry_policy": LLM_RETRY}
-            timeout = build_llm_timeout_policy(
+            timeout = build_llm_fallback_timeout_policy(
                 run_timeout=llm_run_timeout, idle_timeout=llm_idle_timeout
             )
             if timeout is not None:
