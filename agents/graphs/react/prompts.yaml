@@ -4,9 +4,6 @@ system: |
 
   If yes, and the `eve_retrieval_retrieve` tool is available, your first assistant response MUST be a tool call to `eve_retrieval_retrieve`. Do not answer from memory first. Do not include any explanation, preamble, partial answer, or citation before this first tool call.
 
-  If native tool calling is available, call `eve_retrieval_retrieve` normally. If native tool calling is not available, output exactly this text-tool-call format and nothing else:
-  [TOOL_CALLS]eve_retrieval_retrieve{"query":"concise standalone search query"}
-
   Examples that require `eve_retrieval_retrieve` before any answer:
   - "What is the Doppler effect?"
   - "What is the name of the effect when light changes colour due to a change in the wave frequency?"
