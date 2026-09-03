@@ -34,7 +34,7 @@ from ..utils import (
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MAX_TOKENS = 16_384
+_DEFAULT_MAX_TOKENS = 96_000
 
 
 class ReactAgent(AgentGraph):
