@@ -24,6 +24,7 @@ from ..policies import (
     LLM_RETRY,
     build_llm_fallback_timeout_policy,
     llm_node_add_kwargs,
+    make_llm_fallback_error_handler,
 )
 from ..utils import (
     parse_text_tool_calls,
@@ -66,6 +67,7 @@ class ReactAgent(AgentGraph):
         fallback_llm=None,
         llm_run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
         llm_idle_timeout: Optional[float] = DEFAULT_LLM_IDLE_TIMEOUT,
+        on_policy=None,
         **kwargs,
     ):
         instruction = self.instruction_text(history=history, summary=summary)
@@ -146,12 +148,13 @@ class ReactAgent(AgentGraph):
         builder = StateGraph(AgentMessagesState)
         builder.add_node(
             "agent",
-            self.timed_node("agent", agent_fn),
+            self.timed_node("agent", agent_fn, on_policy=on_policy),
             **llm_node_add_kwargs(
                 fallback_node="agent_fallback",
                 has_fallback=has_fallback,
                 llm_run_timeout=llm_run_timeout,
                 llm_idle_timeout=llm_idle_timeout,
+                on_policy=on_policy,
             ),
         )
         builder.add_node("tools", self.make_tools_node(tools))
@@ -162,7 +165,14 @@ class ReactAgent(AgentGraph):
         builder.add_edge("tools", "agent")
 
         if has_fallback:
-            fallback_node_kwargs: dict[str, Any] = {"retry_policy": LLM_RETRY}
+            fallback_node_kwargs: dict[str, Any] = {
+                "retry_policy": LLM_RETRY,
+                "error_handler": make_llm_fallback_error_handler(
+                    fallback_node="agent_fallback",
+                    has_fallback=has_fallback,
+                    on_policy=on_policy,
+                ),
+            }
             timeout = build_llm_fallback_timeout_policy(
                 run_timeout=llm_run_timeout, idle_timeout=llm_idle_timeout
             )
@@ -170,7 +180,9 @@ class ReactAgent(AgentGraph):
                 fallback_node_kwargs["timeout"] = timeout
             builder.add_node(
                 "agent_fallback",
-                self.timed_node("agent_fallback", agent_fallback_fn),
+                self.timed_node(
+                    "agent_fallback", agent_fallback_fn, on_policy=on_policy
+                ),
                 **fallback_node_kwargs,
             )
             builder.add_conditional_edges(
