@@ -6,8 +6,9 @@ node-level ``error_handler`` support.
 
 from __future__ import annotations
 
+import inspect
 import logging
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, Union
 
 from langgraph.errors import NodeError
 from langgraph.types import Command, RetryPolicy, TimeoutPolicy
@@ -41,6 +42,26 @@ def is_transient_llm_error(exc: BaseException) -> bool:
         return True
     status = getattr(getattr(exc, "response", None), "status_code", None)
     return status in (429, 502, 503, 504)
+
+
+retry_on_transient = is_transient_llm_error
+
+
+def is_node_timeout_error(exc: Any) -> bool:
+    """True for LangGraph ``NodeTimeoutError`` (not a stdlib ``TimeoutError``)."""
+    return type(exc).__name__ == "NodeTimeoutError"
+
+
+async def emit_on_policy(on_policy, **kwargs) -> None:
+    """Invoke an optional backend ``on_policy`` callback; never raise to the graph."""
+    if on_policy is None:
+        return
+    try:
+        result = on_policy(**kwargs)
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        logger.exception("on_policy callback failed")
 
 
 # Retry the primary LLM in-place on transient failures before the
@@ -95,27 +116,44 @@ def make_llm_fallback_error_handler(
     *,
     fallback_node: str,
     has_fallback: bool,
+    on_policy: Optional[Callable[..., Any]] = None,
     log: logging.Logger = logger,
-) -> Callable[[Any, NodeError], Command]:
+) -> Callable[[Any, NodeError], Awaitable[Union[Command, None]]]:
     """Return an ``error_handler`` that routes to *fallback_node* on exhausted retries.
 
     Fires after the node's ``retry_policy`` (:data:`LLM_RETRY`) is exhausted, so
     transient blips retry in-place first and only persistent failures escalate
-    here.  If no fallback model was supplied, the original exception is re-raised.
+    here.  If no fallback model was supplied, or the failed node *is* the
+    fallback, the original exception is re-raised (no loop).
 
-    Uses LangGraph's canonical recovery-node pattern: ``Command(goto=fallback_node)``
-    routes to a dedicated separate node rather than looping back to the failing node.
+    When *on_policy* is set (backend Mongo writer), emits ``timeout`` or
+    ``error_handler``, then ``fallback`` before the ``Command(goto=…)``.
     """
 
-    def handler(state: Any, error: NodeError) -> Command:
-        if not has_fallback:
-            raise error.error
+    async def handler(state: Any, error: NodeError):
+        node = getattr(error, "node", None)
+        exc = getattr(error, "error", error)
+        policy = "timeout" if is_node_timeout_error(exc) else "error_handler"
+        await emit_on_policy(
+            on_policy,
+            node=node,
+            policy=policy,
+            error=exc if isinstance(exc, Exception) else None,
+        )
+        if not has_fallback or node == fallback_node:
+            raise exc
         log.warning(
             "Node %s failed (%s: %s), routing to fallback node %r",
-            error.node,
-            type(error.error).__name__,
-            error.error,
+            node,
+            type(exc).__name__,
+            exc,
             fallback_node,
+        )
+        await emit_on_policy(
+            on_policy,
+            node=node,
+            policy="fallback",
+            error=exc if isinstance(exc, Exception) else None,
         )
         return Command(goto=fallback_node)
 
@@ -128,6 +166,7 @@ def llm_node_add_kwargs(
     has_fallback: bool,
     llm_run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
     llm_idle_timeout: Optional[float] = DEFAULT_LLM_IDLE_TIMEOUT,
+    on_policy: Optional[Callable[..., Any]] = None,
 ) -> dict[str, Any]:
     """``add_node`` keyword args for a fault-tolerant LLM node.
 
@@ -139,6 +178,7 @@ def llm_node_add_kwargs(
         "error_handler": make_llm_fallback_error_handler(
             fallback_node=fallback_node,
             has_fallback=has_fallback,
+            on_policy=on_policy,
         ),
     }
     timeout = build_llm_timeout_policy(

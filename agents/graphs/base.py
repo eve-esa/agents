@@ -15,10 +15,20 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.graph import MessagesState
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.runtime import Runtime
 
-from .policies import DEFAULT_LLM_IDLE_TIMEOUT, DEFAULT_LLM_RUN_TIMEOUT
+from .policies import (
+    DEFAULT_LLM_IDLE_TIMEOUT,
+    DEFAULT_LLM_RUN_TIMEOUT,
+    emit_on_policy,
+    is_transient_llm_error,
+    make_llm_fallback_error_handler,
+)
 
 logger = logging.getLogger(__name__)
+
+# Alias used by consuming backends / tests.
+retry_on_transient = is_transient_llm_error
 
 
 class AgentMessagesState(MessagesState):
@@ -255,6 +265,7 @@ class AgentGraph:
         fallback_llm: Optional[BaseChatModel] = None,
         llm_run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
         llm_idle_timeout: Optional[float] = DEFAULT_LLM_IDLE_TIMEOUT,
+        on_policy: Optional[Any] = None,
         **kwargs: Any,
     ) -> CompiledStateGraph:
         """Build and return the compiled StateGraph.  Override in subclass.
@@ -265,8 +276,20 @@ class AgentGraph:
 
         *llm_run_timeout* / *llm_idle_timeout* — per-attempt caps for LLM nodes
         (``TimeoutPolicy``).  Pass ``None`` for both to disable timeouts.
+
+        *on_policy* — optional backend callback ``(node, policy, attempt, error, …)``.
+        The graph never writes Mongo; it only invokes this hook via
+        :func:`emit_on_policy`.
         """
         raise NotImplementedError
+
+    def error_handler(self, *, on_policy=None, fallback_llm=None):
+        """Backend/test helper wrapping :func:`make_llm_fallback_error_handler`."""
+        return make_llm_fallback_error_handler(
+            fallback_node="agent_fallback",
+            has_fallback=fallback_llm is not None,
+            on_policy=on_policy,
+        )
 
     # ── Helper: instrumented tools node ──────────────────────────────────────
 
@@ -319,17 +342,30 @@ class AgentGraph:
 
     # ── Helper: timed node wrapper ────────────────────────────────────────────
 
-    def timed_node(self, node_name: str, fn):
-        """Wrap any async node function with latency logging.
+    def timed_node(self, node_name: str, fn, *, on_policy=None):
+        """Wrap any async node function with latency logging and retry observation.
 
-        Usage::
-
-            builder.add_node("agent", self.timed_node("agent", my_agent_fn))
+        LangGraph re-invokes this wrapper on ``RetryPolicy``;
+        ``runtime.execution_info.node_attempt`` is the official retry signal.
         """
 
-        async def wrapper(state):
+        async def wrapper(state, runtime: Runtime | None = None):
+            attempt = 1
+            if runtime is not None:
+                info = getattr(runtime, "execution_info", None)
+                if info is not None:
+                    attempt = getattr(info, "node_attempt", 1) or 1
+            if attempt > 1:
+                await emit_on_policy(
+                    on_policy,
+                    node=node_name,
+                    policy="retry",
+                    attempt=attempt,
+                )
             start = time.perf_counter()
-            result = await fn(state)
+            result = fn(state)
+            if inspect.isawaitable(result):
+                result = await result
             elapsed = time.perf_counter() - start
             logger.info("Node '%s' completed in %.3fs", node_name, elapsed)
             return result
