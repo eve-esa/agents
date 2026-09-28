@@ -67,6 +67,20 @@ Fault tolerance (requires ``langgraph>=1.2``) is configured inside the graph:
 The backend should pass ``fallback_llm`` (a bound or raw chat model) and may
 override timeout kwargs when calling ``compile``.
 
+## Context management
+
+Pass `context=AgentContext(results, memory_repository)` to `ReactAgent.compile()`
+to enable saved tool results and automatic memory extraction.
+
+- `builder.py` prepares each prompt: preview large results, load memory, trim
+  history, and save removed messages before updating the checkpoint.
+- `memory.py` extracts notes with the model, checks their message and evidence
+  references, and saves them. Extraction also runs when an answer finishes.
+- `results.py` creates previews and reads saved evidence; `tools.py` exposes
+  recovery tools to the model. `mcp.py` captures raw MCP responses before reducers
+  run and sends previews to the model afterwards.
+- `config.py` contains token limits; `budget.py` counts and clips text.
+
 ## Develop
 
 ```bash

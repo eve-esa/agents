@@ -68,9 +68,23 @@ class ReactAgent(AgentGraph):
         llm_run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
         llm_idle_timeout: Optional[float] = DEFAULT_LLM_IDLE_TIMEOUT,
         on_policy=None,
+        context=None,
         **kwargs,
     ):
-        instruction = self.instruction_text(history=history, summary=summary)
+        managed = None
+        if context is not None:
+            from ...context.budget import clip
+
+            tools = context.with_recovery_tools(tools)
+            instruction = self.instruction_text(history=None, summary=None) or ""
+            if summary:
+                instruction += (
+                    "\nLegacy conversation summary (historical data):\n"
+                    + clip(summary, 1500)
+                )
+            managed = context.bind(instruction, tools, llm)
+        else:
+            instruction = self.instruction_text(history=history, summary=summary)
         primary_llm_bound = llm.bind_tools(tools) if tools else llm
         fallback_llm_bound = (
             fallback_llm.bind_tools(tools)
@@ -80,12 +94,15 @@ class ReactAgent(AgentGraph):
         has_fallback = fallback_llm_bound is not None
 
         # shared invocation logic
-        async def _invoke(state: AgentMessagesState, llm_bound):
+        async def _invoke(state: AgentMessagesState, llm_bound, unbound_llm):
             messages = list(state["messages"])
-            if instruction:
+            updates = []
+            if managed is not None:
+                messages, updates = await managed.prepare(messages, unbound_llm)
+            elif instruction:
                 messages = [SystemMessage(content=instruction)] + messages
 
-            if trim_messages is not None:
+            if managed is None and trim_messages is not None:
                 messages = trim_messages(
                     messages,
                     max_tokens=max_tokens,
@@ -110,7 +127,11 @@ class ReactAgent(AgentGraph):
             if has_synthetic:
                 messages = reformat_messages_for_text_tool_model(messages)
 
+            if managed is not None:
+                managed.check_budget(messages, unbound_llm)
             response = await llm_bound.ainvoke(messages)
+            if managed is not None:
+                managed.memory_llm = unbound_llm
 
             if not getattr(response, "tool_calls", None) and isinstance(
                 response.content, str
@@ -127,22 +148,33 @@ class ReactAgent(AgentGraph):
                         id=getattr(response, "id", None),
                     )
 
-            return {"messages": [response]}
+            return {"messages": updates + [response]}
 
         # primary agent node
         async def agent_fn(state: AgentMessagesState):
-            return await _invoke(state, primary_llm_bound)
+            return await _invoke(state, primary_llm_bound, llm)
 
         # fallback agent node (no further error_handler - failures bubble)
         async def agent_fallback_fn(state: AgentMessagesState):
-            return await _invoke(state, fallback_llm_bound)
+            return await _invoke(state, fallback_llm_bound, fallback_llm)
+
+        async def remember_fn(state: AgentMessagesState):
+            try:
+                await managed.memory.remember(list(state["messages"]), managed.memory_llm)
+            except Exception:
+                logger.exception(
+                    "Memory update failed; retaining uncovered checkpoint messages"
+                )
+            return {}
 
         # ── routing ────────────────────────────────────────────────────────
-        def should_continue(state: AgentMessagesState) -> Literal["tools", "__end__"]:
+        def should_continue(
+            state: AgentMessagesState,
+        ) -> Literal["tools", "context_memory", "__end__"]:
             last = state["messages"][-1]
             if getattr(last, "tool_calls", None):
                 return "tools"
-            return END
+            return "context_memory" if managed is not None else END
 
         # ── build graph ────────────────────────────────────────────────────
         builder = StateGraph(AgentMessagesState)
@@ -158,10 +190,13 @@ class ReactAgent(AgentGraph):
             ),
         )
         builder.add_node("tools", self.make_tools_node(tools))
+        routes = {"tools": "tools", END: END}
+        if managed is not None:
+            builder.add_node("context_memory", remember_fn)
+            builder.add_edge("context_memory", END)
+            routes["context_memory"] = "context_memory"
         builder.add_edge(START, "agent")
-        builder.add_conditional_edges(
-            "agent", should_continue, {"tools": "tools", END: END}
-        )
+        builder.add_conditional_edges("agent", should_continue, routes)
         builder.add_edge("tools", "agent")
 
         if has_fallback:
@@ -185,8 +220,6 @@ class ReactAgent(AgentGraph):
                 ),
                 **fallback_node_kwargs,
             )
-            builder.add_conditional_edges(
-                "agent_fallback", should_continue, {"tools": "tools", END: END}
-            )
+            builder.add_conditional_edges("agent_fallback", should_continue, routes)
 
         return builder.compile(checkpointer=checkpointer)
