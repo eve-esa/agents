@@ -48,6 +48,12 @@ receives ``history`` (message list) and ``summary`` from the runner. The base
 ``format_history`` serialises summary + turns to text, and ``instruction_text``
 prepends that to ``prompts['system']``.
 
+A section of ``system`` that describes one tool goes in ``prompts['tool_sections']`` with the
+tool it ``requires``, and ``system`` holds its ``[[name]]`` marker. ``instruction_text(tool_names=...)``
+keeps the section only when that tool is bound, so the model is never told about a tool it cannot
+call. Without ``tool_names`` every section is kept. The react graph uses this for
+``eve_retrieval_retrieve``.
+
 Fault tolerance (requires ``langgraph>=1.2``) is configured inside the graph:
 
 - **LLM nodes** — ``TimeoutPolicy`` (``llm_run_timeout`` / ``llm_idle_timeout``),

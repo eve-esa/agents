@@ -6,9 +6,10 @@ No backend (src.*) imports. Safe to use in standalone scripts/notebooks.
 
 import inspect
 import logging
+import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import ToolMessage
@@ -229,18 +230,50 @@ class AgentGraph:
 
     # ── Instruction builder ───────────────────────────────────────────────────
 
+    def render_tool_sections(
+        self, body: str, tool_names: Optional[Iterable[str]] = None
+    ) -> str:
+        """Fill the ``[[name]]`` markers of ``prompts['tool_sections']`` in *body*.
+
+        A section is kept only when the tool it ``requires`` is in *tool_names*;
+        otherwise its marker line is dropped, so the model is never told about a
+        tool it cannot call.  ``tool_names=None`` means "unknown" and keeps every
+        section, which is the behaviour before tool sections existed.
+        """
+        sections = self.prompts.get("tool_sections") or {}
+        bound = None if tool_names is None else set(tool_names)
+        for name, section in sections.items():
+            marker = f"[[{name}]]"
+            if not isinstance(section, dict):
+                continue
+            keep = bound is None or section.get("requires") in bound
+            text = str(section.get("text") or "").strip() if keep else ""
+            body = re.sub(
+                rf"^[ \t]*{re.escape(marker)}[ \t]*\n?",
+                lambda _m, t=text: f"{t}\n" if t else "",
+                body,
+                flags=re.MULTILINE,
+            )
+        return re.sub(r"\n{3,}", "\n\n", body).strip()
+
     def instruction_text(
         self,
         history: Optional[List[Any]] = None,
         summary: Optional[str] = None,
+        tool_names: Optional[Iterable[str]] = None,
     ) -> Optional[str]:
         """Build the full lead-in instruction: history prefix + ``prompts['system']``.
 
         *history* and *summary* are serialised by :meth:`format_history` and
         prepended to the YAML ``system`` value.  Either or both may be omitted.
+        *tool_names* are the tools bound to the model: sections of
+        ``prompts['tool_sections']`` that require another tool are left out
+        (see :meth:`render_tool_sections`).
         """
         raw = self.prompts.get("system")
         body = str(raw).strip() if raw else None
+        if body:
+            body = self.render_tool_sections(body, tool_names)
         if not body:
             body = None
 

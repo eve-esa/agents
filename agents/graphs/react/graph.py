@@ -70,7 +70,11 @@ class ReactAgent(AgentGraph):
         on_policy=None,
         **kwargs,
     ):
-        instruction = self.instruction_text(history=history, summary=summary)
+        instruction = self.instruction_text(
+            history=history,
+            summary=summary,
+            tool_names=[tool.name for tool in tools],
+        )
         primary_llm_bound = llm.bind_tools(tools) if tools else llm
         fallback_llm_bound = (
             fallback_llm.bind_tools(tools)
