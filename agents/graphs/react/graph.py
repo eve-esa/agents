@@ -6,6 +6,7 @@ relative so this tree can be cloned as its own repository.
 """
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, List, Literal, Optional
 
 from langchain_core.messages import (
@@ -82,8 +83,23 @@ class ReactAgent(AgentGraph):
         # shared invocation logic
         async def _invoke(state: AgentMessagesState, llm_bound):
             messages = list(state["messages"])
+            # Resolve at invocation time so cached graphs and resumed threads
+            # do not keep the date on which they were compiled.
+            now = datetime.now(timezone.utc)
+            runtime_context = (
+                "## Clock\n"
+                f"Current UTC timestamp: {now.isoformat(timespec='seconds')}\n"
+                f"Current UTC date: {now.date().isoformat()}\n"
+                f"Current UTC year: {now.year}\n"
+                "Use this clock for the current date/year and relative dates, "
+                "not the knowledge cutoff or dates in conversation history. "
+                "For local requests, interpret this instant in the requested "
+                "location's timezone.\n"
+            )
+            system_instruction = runtime_context
             if instruction:
-                messages = [SystemMessage(content=instruction)] + messages
+                system_instruction += "\n" + instruction
+            messages = [SystemMessage(content=system_instruction)] + messages
 
             if trim_messages is not None:
                 messages = trim_messages(
