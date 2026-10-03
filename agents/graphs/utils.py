@@ -1,32 +1,17 @@
 """Shared utilities for agent graphs — no backend dependencies.
 
 Contains text-format tool-call parsing (Mistral/EVE-Instruct), message
-reformatting, SSE label generation, token counting, and tool input schemas.
+reformatting and token counting.
 
-Only depends on standard library + langchain-core + pydantic.
+Only depends on standard library + langchain-core.
 Safe to import from standalone scripts/notebooks.
 """
 
 import json
 import re
-from typing import Any, Dict, List, Optional
-
-from pydantic import BaseModel, Field
+from typing import Any, Dict, List
 
 _TEXT_TOOL_CALL_MARKER = "[TOOL_CALLS]"
-
-
-# ─── SSE label generation ─────────────────────────────────────────────────────
-
-
-def tool_call_label(tool_name: str) -> str:
-    """Return a human-readable label for a streaming tool-call event."""
-    if "knowledge_base" in tool_name:
-        return "Searching knowledge base"
-    if "wiley" in tool_name.lower():
-        return "Searching Wiley Gateway"
-    pretty = tool_name.replace("_", " ").replace("-", " ").strip()
-    return f"Calling {pretty}" if pretty else "Calling tool"
 
 
 # ─── Text-format tool-call parsing (Mistral / EVE-Instruct) ───────────────────
@@ -92,11 +77,6 @@ def parse_text_tool_calls(content: str) -> List[Dict[str, Any]]:
                 }
             )
     return calls
-
-
-def has_text_tool_call(content: str) -> bool:
-    """Return True if *content* contains a text-format tool call marker."""
-    return _TEXT_TOOL_CALL_MARKER in content
 
 
 # ─── Message history sanitisation ─────────────────────────────────────────────
@@ -188,16 +168,3 @@ def tiktoken_counter(messages: List[Any]) -> int:
         return total
     except Exception:
         return sum(len(str(getattr(m, "content", m))) // 4 for m in messages)
-
-
-# ─── Tool input schemas ───────────────────────────────────────────────────────
-
-
-class SearchWileyInput(BaseModel):
-    query: str = Field(description="Search query for scientific articles")
-    start_year: Optional[int] = Field(
-        default=None, description="Start year filter (inclusive)"
-    )
-    end_year: Optional[int] = Field(
-        default=None, description="End year filter (inclusive)"
-    )
