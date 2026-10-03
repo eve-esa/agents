@@ -44,9 +44,6 @@ def is_transient_llm_error(exc: BaseException) -> bool:
     return status in (429, 502, 503, 504)
 
 
-retry_on_transient = is_transient_llm_error
-
-
 def is_node_timeout_error(exc: Any) -> bool:
     """True for LangGraph ``NodeTimeoutError`` (not a stdlib ``TimeoutError``)."""
     return type(exc).__name__ == "NodeTimeoutError"
