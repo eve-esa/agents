@@ -19,6 +19,7 @@ class ScriptedChatModel(BaseChatModel):
 
     replies: List[AIMessage] = []
     log: Any = None
+    systems: Any = None
 
     @property
     def _llm_type(self) -> str:
@@ -29,6 +30,7 @@ class ScriptedChatModel(BaseChatModel):
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
         self.log.append(("model", len(messages)))
+        self.systems.append(messages[0].content)
         reply = self.replies.pop(0) if self.replies else AIMessage(content="answer")
         return ChatResult(generations=[ChatGeneration(message=reply)])
 
@@ -49,8 +51,10 @@ def make_tools(log):
     return [retrieve, geocode]
 
 
-def build(log, replies=None, tools=None):
-    model = ScriptedChatModel(replies=list(replies or []), log=log)
+def build(log, replies=None, tools=None, systems=None):
+    model = ScriptedChatModel(
+        replies=list(replies or []), log=log, systems=[] if systems is None else systems
+    )
     return ReactAgent().compile(
         llm=model,
         tools=make_tools(log) if tools is None else tools,
@@ -155,12 +159,15 @@ def test_model_may_call_any_tool_after_the_forced_call():
 def test_forced_call_happens_on_every_human_turn_with_a_unique_id():
     log: list = []
     graph = build(log)
-    run(graph, "turn one", RETRIEVE)
-    out = run(graph, "turn two", RETRIEVE)
+    run(graph, "What is SAR?", RETRIEVE)
+    out = run(graph, "and in 2020?", RETRIEVE)
 
-    assert [e for e in log if e[0] == RETRIEVE] == [(RETRIEVE, "turn one"), (RETRIEVE, "turn two")]
+    assert [e for e in log if e[0] == RETRIEVE] == [
+        (RETRIEVE, "What is SAR?"),
+        (RETRIEVE, "What is SAR? and in 2020?"),
+    ]
     calls = forced_calls(out["messages"])
-    assert [c["args"]["query"] for c in calls] == ["turn one", "turn two"]
+    assert [c["args"]["query"] for c in calls] == ["What is SAR?", "What is SAR? and in 2020?"]
     assert calls[0]["id"] != calls[1]["id"]
     assert all(c["id"].isalnum() and len(c["id"]) == 9 for c in calls)
 
@@ -191,3 +198,38 @@ def test_forced_call_is_streamed_as_a_message_of_its_own_node():
     seen = asyncio.run(streamed())
     assert seen[0] == ("force_tool", "AIMessage", True)
     assert seen[1][:2] == ("tools", "ToolMessage")
+
+
+def test_follow_up_query_is_capped_and_keeps_the_current_question_whole():
+    log: list = []
+    graph = build(log)
+    run(graph, "x" * 2000, None)
+    current = "and what about the 2020 floods in Pakistan?"
+    run(graph, current, RETRIEVE)
+
+    query = [e for e in log if e[0] == RETRIEVE][0][1]
+    assert query.endswith(" " + current)
+    assert len(query) == 500
+
+
+def test_model_is_told_only_when_the_call_was_forced():
+    log: list = []
+    systems: list = []
+    graph = build(log, systems=systems)
+    run(graph, "Doppler", RETRIEVE, thread="forced")
+    run(graph, "Doppler", None, thread="free")
+
+    assert len(systems) == 2
+    assert f"{RETRIEVE} already ran for this question" in systems[0]
+    assert "already ran for this question" not in systems[1]
+
+
+def test_note_is_gone_on_the_next_unforced_turn_of_the_same_thread():
+    log: list = []
+    systems: list = []
+    graph = build(log, systems=systems)
+    run(graph, "turn one", RETRIEVE)
+    run(graph, "turn two", None)
+
+    assert "already ran for this question" in systems[0]
+    assert "already ran for this question" not in systems[1]

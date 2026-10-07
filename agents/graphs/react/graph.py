@@ -42,21 +42,45 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAX_TOKENS = 96_000
 
 
-def _forced_tool_query(messages: List[Any], tool_name: str) -> Optional[str]:
-    """Text of the last human message, or None when this turn already called *tool_name*."""
+# A follow-up ("and in 2020?") retrieves on nothing alone, so the forced query
+# carries the previous question too, cut so the current one always fits.
+_FORCED_QUERY_MAX_CHARS = 500
+_FORCED_ID_PREFIX = "force_first_tool-"
+
+
+def _human_text(msg: HumanMessage) -> str:
+    content = msg.content
+    if isinstance(content, list):
+        content = " ".join(
+            c.get("text", "") if isinstance(c, dict) else str(c) for c in content
+        )
+    return str(content).strip()
+
+
+def _forced_tool_query(messages: List[Any]) -> Optional[str]:
+    """Query for the forced call, or None unless the run starts on a human message."""
+    if not messages or not isinstance(messages[-1], HumanMessage):
+        return None
+    current = _human_text(messages[-1])
+    if not current:
+        return None
+    previous = next(
+        (_human_text(m) for m in reversed(messages[:-1]) if isinstance(m, HumanMessage)),
+        "",
+    )
+    room = _FORCED_QUERY_MAX_CHARS - len(current) - 1
+    if not previous or room <= 0:
+        return current
+    return f"{previous[:room].rstrip()} {current}"
+
+
+def _forced_tool_this_turn(messages: List[Any]) -> Optional[str]:
+    """Name of the tool forced since the last human message, if any."""
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage):
-            content = msg.content
-            if isinstance(content, list):
-                content = " ".join(
-                    c.get("text", "") if isinstance(c, dict) else str(c)
-                    for c in content
-                )
-            return str(content).strip() or None
-        if isinstance(msg, AIMessage) and any(
-            tc["name"] == tool_name for tc in (msg.tool_calls or [])
-        ):
             return None
+        if isinstance(msg, AIMessage) and (msg.id or "").startswith(_FORCED_ID_PREFIX):
+            return msg.tool_calls[0]["name"]
     return None
 
 
@@ -124,6 +148,14 @@ class ReactAgent(AgentGraph):
             system_instruction = runtime_context
             if instruction:
                 system_instruction += "\n" + instruction
+            forced = _forced_tool_this_turn(messages)
+            if forced:
+                system_instruction += (
+                    "\n## Forced tool call\n"
+                    f"{forced} already ran for this question with the user's "
+                    "selected settings; its result is above. Call it again only "
+                    "for a clearly different query.\n"
+                )
             messages = [SystemMessage(content=system_instruction)] + messages
 
             if trim_messages is not None:
@@ -184,7 +216,7 @@ class ReactAgent(AgentGraph):
             name = (config.get("configurable") or {}).get("force_first_tool")
             if not name or name not in tool_names:
                 return None, None
-            return name, _forced_tool_query(state["messages"], name)
+            return name, _forced_tool_query(state["messages"])
 
         # synthetic tool call, executed by the tools node like a model call
         def force_tool_fn(state: AgentMessagesState, config: RunnableConfig):
@@ -196,7 +228,12 @@ class ReactAgent(AgentGraph):
                 "id": uuid.uuid4().hex[:9],
                 "type": "tool_call",
             }
-            return {"messages": [AIMessage(content="", tool_calls=[call])]}
+            forced = AIMessage(
+                content="",
+                tool_calls=[call],
+                id=f"{_FORCED_ID_PREFIX}{call['id']}",
+            )
+            return {"messages": [forced]}
 
         # ── routing ────────────────────────────────────────────────────────
         def route_start(
