@@ -6,18 +6,15 @@ relative so this tree can be cloned as its own repository.
 """
 
 import logging
-import uuid
 from datetime import datetime, timezone
 from typing import Any, List, Literal, Optional
 
 from langchain_core.messages import (
     AIMessage,
-    HumanMessage,
     SystemMessage,
     ToolMessage,
     trim_messages,
 )
-from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 
@@ -42,49 +39,6 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAX_TOKENS = 96_000
 
 
-# A follow-up ("and in 2020?") retrieves on nothing alone, so the forced query
-# carries the previous question too; the cap trims the previous one first.
-_FORCED_QUERY_MAX_CHARS = 500
-_FORCED_ID_PREFIX = "force_first_tool-"
-
-
-def _human_text(msg: HumanMessage) -> str:
-    content = msg.content
-    if isinstance(content, list):
-        content = " ".join(
-            c.get("text", "") if isinstance(c, dict) else str(c) for c in content
-        )
-    return str(content).strip()
-
-
-def _forced_tool_query(messages: List[Any]) -> Optional[str]:
-    """Query for the forced call, or None unless the run starts on a human message."""
-    if not messages or not isinstance(messages[-1], HumanMessage):
-        return None
-    current = _human_text(messages[-1])[:_FORCED_QUERY_MAX_CHARS]
-    if not current:
-        return None
-    previous = next(
-        (_human_text(m) for m in reversed(messages[:-1]) if isinstance(m, HumanMessage)),
-        "",
-    )
-    room = _FORCED_QUERY_MAX_CHARS - len(current) - 1
-    # A retry repeats the question: prepending it adds nothing.
-    if not previous or previous[:_FORCED_QUERY_MAX_CHARS] == current or room <= 0:
-        return current
-    return f"{previous[:room].rstrip()} {current}"
-
-
-def _forced_tool_this_turn(messages: List[Any]) -> Optional[str]:
-    """Name of the tool forced since the last human message, if any."""
-    for msg in reversed(messages):
-        if isinstance(msg, HumanMessage):
-            return None
-        if isinstance(msg, AIMessage) and (msg.id or "").startswith(_FORCED_ID_PREFIX):
-            return msg.tool_calls[0]["name"]
-    return None
-
-
 class ReactAgent(AgentGraph):
     """Manual ReAct loop: agent -> tools -> agent, with text-format fallback.
 
@@ -98,10 +52,6 @@ class ReactAgent(AgentGraph):
     surfaced back to the agent as ``ToolMessage`` content so the ReAct loop can
     recover, rather than retried at the node level (a node-level retry would
     re-invoke every tool call in the turn).
-
-    A run with ``force_first_tool`` in ``config["configurable"]`` naming a bound
-    tool calls that tool once with ``{"query": <last human message>}`` before
-    the model answers; the call goes through the same ``tools`` node.
     """
 
     name = "react"
@@ -149,14 +99,6 @@ class ReactAgent(AgentGraph):
             system_instruction = runtime_context
             if instruction:
                 system_instruction += "\n" + instruction
-            forced = _forced_tool_this_turn(messages)
-            if forced:
-                system_instruction += (
-                    "\n## Forced tool call\n"
-                    f"{forced} already ran for this question with the user's "
-                    "selected settings; its result is above. Call it again only "
-                    "for a clearly different query.\n"
-                )
             messages = [SystemMessage(content=system_instruction)] + messages
 
             if trim_messages is not None:
@@ -211,38 +153,7 @@ class ReactAgent(AgentGraph):
         async def agent_fallback_fn(state: AgentMessagesState):
             return await _invoke(state, fallback_llm_bound)
 
-        tool_names = {t.name for t in tools}
-
-        def _forced_tool(state: AgentMessagesState, config: RunnableConfig):
-            name = (config.get("configurable") or {}).get("force_first_tool")
-            if not name or name not in tool_names:
-                return None, None
-            return name, _forced_tool_query(state["messages"])
-
-        # synthetic tool call, executed by the tools node like a model call
-        def force_tool_fn(state: AgentMessagesState, config: RunnableConfig):
-            name, query = _forced_tool(state, config)
-            call = {
-                "name": name,
-                "args": {"query": query},
-                # 9 alphanumerics: the only id shape Mistral accepts.
-                "id": uuid.uuid4().hex[:9],
-                "type": "tool_call",
-            }
-            forced = AIMessage(
-                content="",
-                tool_calls=[call],
-                id=f"{_FORCED_ID_PREFIX}{call['id']}",
-            )
-            return {"messages": [forced]}
-
         # ── routing ────────────────────────────────────────────────────────
-        def route_start(
-            state: AgentMessagesState, config: RunnableConfig
-        ) -> Literal["force_tool", "agent"]:
-            _, query = _forced_tool(state, config)
-            return "force_tool" if query else "agent"
-
         def should_continue(state: AgentMessagesState) -> Literal["tools", "__end__"]:
             last = state["messages"][-1]
             if getattr(last, "tool_calls", None):
@@ -263,11 +174,7 @@ class ReactAgent(AgentGraph):
             ),
         )
         builder.add_node("tools", self.make_tools_node(tools))
-        builder.add_node("force_tool", force_tool_fn)
-        builder.add_conditional_edges(
-            START, route_start, {"force_tool": "force_tool", "agent": "agent"}
-        )
-        builder.add_edge("force_tool", "tools")
+        builder.add_edge(START, "agent")
         builder.add_conditional_edges(
             "agent", should_continue, {"tools": "tools", END: END}
         )
