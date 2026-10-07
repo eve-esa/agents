@@ -6,15 +6,18 @@ relative so this tree can be cloned as its own repository.
 """
 
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import Any, List, Literal, Optional
 
 from langchain_core.messages import (
     AIMessage,
+    HumanMessage,
     SystemMessage,
     ToolMessage,
     trim_messages,
 )
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
 
@@ -39,6 +42,24 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAX_TOKENS = 96_000
 
 
+def _forced_tool_query(messages: List[Any], tool_name: str) -> Optional[str]:
+    """Text of the last human message, or None when this turn already called *tool_name*."""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            content = msg.content
+            if isinstance(content, list):
+                content = " ".join(
+                    c.get("text", "") if isinstance(c, dict) else str(c)
+                    for c in content
+                )
+            return str(content).strip() or None
+        if isinstance(msg, AIMessage) and any(
+            tc["name"] == tool_name for tc in (msg.tool_calls or [])
+        ):
+            return None
+    return None
+
+
 class ReactAgent(AgentGraph):
     """Manual ReAct loop: agent -> tools -> agent, with text-format fallback.
 
@@ -52,6 +73,10 @@ class ReactAgent(AgentGraph):
     surfaced back to the agent as ``ToolMessage`` content so the ReAct loop can
     recover, rather than retried at the node level (a node-level retry would
     re-invoke every tool call in the turn).
+
+    A run with ``force_first_tool`` in ``config["configurable"]`` naming a bound
+    tool calls that tool once with ``{"query": <last human message>}`` before
+    the model answers; the call goes through the same ``tools`` node.
     """
 
     name = "react"
@@ -153,7 +178,33 @@ class ReactAgent(AgentGraph):
         async def agent_fallback_fn(state: AgentMessagesState):
             return await _invoke(state, fallback_llm_bound)
 
+        tool_names = {t.name for t in tools}
+
+        def _forced_tool(state: AgentMessagesState, config: RunnableConfig):
+            name = (config.get("configurable") or {}).get("force_first_tool")
+            if not name or name not in tool_names:
+                return None, None
+            return name, _forced_tool_query(state["messages"], name)
+
+        # synthetic tool call, executed by the tools node like a model call
+        def force_tool_fn(state: AgentMessagesState, config: RunnableConfig):
+            name, query = _forced_tool(state, config)
+            call = {
+                "name": name,
+                "args": {"query": query},
+                # 9 alphanumerics: the only id shape Mistral accepts.
+                "id": uuid.uuid4().hex[:9],
+                "type": "tool_call",
+            }
+            return {"messages": [AIMessage(content="", tool_calls=[call])]}
+
         # ── routing ────────────────────────────────────────────────────────
+        def route_start(
+            state: AgentMessagesState, config: RunnableConfig
+        ) -> Literal["force_tool", "agent"]:
+            _, query = _forced_tool(state, config)
+            return "force_tool" if query else "agent"
+
         def should_continue(state: AgentMessagesState) -> Literal["tools", "__end__"]:
             last = state["messages"][-1]
             if getattr(last, "tool_calls", None):
@@ -174,7 +225,11 @@ class ReactAgent(AgentGraph):
             ),
         )
         builder.add_node("tools", self.make_tools_node(tools))
-        builder.add_edge(START, "agent")
+        builder.add_node("force_tool", force_tool_fn)
+        builder.add_conditional_edges(
+            START, route_start, {"force_tool": "force_tool", "agent": "agent"}
+        )
+        builder.add_edge("force_tool", "tools")
         builder.add_conditional_edges(
             "agent", should_continue, {"tools": "tools", END: END}
         )
