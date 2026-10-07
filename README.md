@@ -67,10 +67,6 @@ Fault tolerance (requires ``langgraph>=1.2``) is configured inside the graph:
 The backend should pass ``fallback_llm`` (a bound or raw chat model) and may
 override timeout kwargs when calling ``compile``.
 
-The react graph reads ``force_first_tool`` from ``config["configurable"]``. When it names a
-bound tool, the run starts with one call to that tool, ``{"query": <last human message>}``,
-through the ``tools`` node, then the normal loop continues. Unset, the graph runs as before.
-
 ## Develop
 
 ```bash
