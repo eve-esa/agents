@@ -233,3 +233,21 @@ def test_note_is_gone_on_the_next_unforced_turn_of_the_same_thread():
 
     assert "already ran for this question" in systems[0]
     assert "already ran for this question" not in systems[1]
+
+
+def test_retry_of_the_same_question_is_not_prepended():
+    log: list = []
+    graph = build(log)
+    run(graph, "What is SAR?", RETRIEVE)
+    run(graph, "What is SAR?", RETRIEVE)
+
+    assert [e[1] for e in log if e[0] == RETRIEVE] == ["What is SAR?", "What is SAR?"]
+
+
+def test_long_current_question_is_capped_too():
+    log: list = []
+    graph = build(log)
+    run(graph, "previous question", None)
+    run(graph, "y" * 2000, RETRIEVE)
+
+    assert [e[1] for e in log if e[0] == RETRIEVE] == ["y" * 500]

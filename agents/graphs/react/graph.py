@@ -43,7 +43,7 @@ _DEFAULT_MAX_TOKENS = 96_000
 
 
 # A follow-up ("and in 2020?") retrieves on nothing alone, so the forced query
-# carries the previous question too, cut so the current one always fits.
+# carries the previous question too; the cap trims the previous one first.
 _FORCED_QUERY_MAX_CHARS = 500
 _FORCED_ID_PREFIX = "force_first_tool-"
 
@@ -61,7 +61,7 @@ def _forced_tool_query(messages: List[Any]) -> Optional[str]:
     """Query for the forced call, or None unless the run starts on a human message."""
     if not messages or not isinstance(messages[-1], HumanMessage):
         return None
-    current = _human_text(messages[-1])
+    current = _human_text(messages[-1])[:_FORCED_QUERY_MAX_CHARS]
     if not current:
         return None
     previous = next(
@@ -69,7 +69,8 @@ def _forced_tool_query(messages: List[Any]) -> Optional[str]:
         "",
     )
     room = _FORCED_QUERY_MAX_CHARS - len(current) - 1
-    if not previous or room <= 0:
+    # A retry repeats the question: prepending it adds nothing.
+    if not previous or previous[:_FORCED_QUERY_MAX_CHARS] == current or room <= 0:
         return current
     return f"{previous[:room].rstrip()} {current}"
 
