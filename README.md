@@ -72,23 +72,30 @@ override timeout kwargs when calling ``compile``.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
+pytest
 ```
 
-(optional `[dev]` can be added in `pyproject.toml` later)
+## Release
 
-## Publish to GitHub
+`main` is what dev runs. A push to `main` dispatches `deploy-dev` in
+[eve-esa/backend](https://github.com/eve-esa/backend) on that repo's `main`,
+and the image installs this commit.
 
-From this directory (after `git clone` or `git init` with `origin` set):
+release-please keeps a `chore(main): release x.y.z` pull request open. Merging
+it tags `vX.Y.Z`, publishes the sdist and wheel on the GitHub Release, and
+opens a backend pull request titled `fix(deps): pin agents to vX.Y.Z` that
+writes the tag to `agents.ref`. Merging that, then the backend's own release
+pull request, builds the image staging promotes. Production stays a manual
+dispatch of the backend's promote-prod workflow, with one approval.
 
-```bash
-git add -A
-git commit -m "Initial release 0.1.0 — pip package agents.graphs"
-git branch -M main
-git push -u origin main
-```
+Dev installs a commit SHA, never the branch name `main`. The backend Dockerfile
+caches the agents install on the build-arg text, so a floating branch name
+would reuse a stale layer.
 
-Then pin in downstream `requirements.txt`:
+Pull request titles must be [Conventional Commits](https://www.conventionalcommits.org/).
+Squash merges use the title as the commit subject, and that subject is what
+release-please versions.
 
-```
-eve-esa-agents @ git+https://github.com/eve-esa/agents.git@main
-```
+The `BACKEND_DISPATCH_TOKEN` secret on this repo has to be able to dispatch
+workflows and open pull requests on `eve-esa/backend`. Without it, the dev
+dispatch and the pin pull request fail.

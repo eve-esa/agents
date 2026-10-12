@@ -1,0 +1,132 @@
+# release-please keeps one pull request open, "chore(main): release x.y.z", and rewrites it on
+# every merge to main. Merging that pull request cuts the release: version files, the tag, and
+# the GitHub Release. This workflow then uploads the sdist and wheel, and opens a backend pull
+# request that pins agents.ref to the tag.
+#
+# Dev is not this workflow. notify-backend.yml dispatches the backend dev build on every push
+# to main, including this release commit.
+name: "release: draft or cut"
+run-name: release on ${{ github.ref_name }}
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Draft or cut the release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      released: ${{ steps.rp.outputs.release_created }}
+      tag: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      # The default GITHUB_TOKEN, deliberately. GitHub does not start workflow runs from events
+      # raised with it. The consequence: no CI runs on the release pull request, so CI cannot be
+      # a required check on it. The backend pin below does not depend on the tag push; this job
+      # opens that pull request itself.
+      - name: Run release-please
+        id: rp
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  publish:
+    name: Publish distributions
+    needs: release-please
+    if: needs.release-please.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        run: pip install build && python -m build
+
+      - name: Upload to the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release-please.outputs.tag }}
+        run: gh release upload "$TAG" dist/*
+
+  # fix, not chore: the backend release-please config hides chore, so a chore title would not
+  # cut a backend release and staging would never see this tag.
+  pin-backend:
+    name: Open backend pin PR
+    needs: release-please
+    if: needs.release-please.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Open the backend pin pull request
+        env:
+          GH_TOKEN: ${{ secrets.BACKEND_DISPATCH_TOKEN }}
+          TAG: ${{ needs.release-please.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "ERROR: BACKEND_DISPATCH_TOKEN is not set on eve-esa/agents."
+            echo "It needs contents, pull requests, and actions write on eve-esa/backend."
+            exit 1
+          fi
+
+          REPO=eve-esa/backend
+          BRANCH="fix/pin-agents-${TAG}"
+
+          OPEN=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number --jq 'length')
+          if [ "$OPEN" != "0" ]; then
+            echo "pin PR already open on ${BRANCH}"
+            exit 0
+          fi
+
+          if ! gh api "repos/${REPO}/git/ref/heads/${BRANCH}" >/dev/null 2>&1; then
+            BASE=$(gh api "repos/${REPO}/git/ref/heads/main" --jq .object.sha)
+            gh api --method POST "repos/${REPO}/git/refs" \
+              -f ref="refs/heads/${BRANCH}" \
+              -f sha="$BASE" >/dev/null
+          fi
+
+          if ! FILE_SHA=$(gh api "repos/${REPO}/contents/agents.ref?ref=${BRANCH}" --jq .sha 2>/dev/null); then
+            FILE_SHA=
+          fi
+          CONTENT=$(printf '%s\n' "$TAG" | base64 -w0)
+          ARGS=(
+            --method PUT
+            "repos/${REPO}/contents/agents.ref"
+            -f message="fix(deps): pin agents to ${TAG}"
+            -f content="$CONTENT"
+            -f branch="$BRANCH"
+          )
+          if [ -n "$FILE_SHA" ]; then
+            ARGS+=(-f "sha=${FILE_SHA}")
+          fi
+          gh api "${ARGS[@]}" >/dev/null
+
+          gh pr create --repo "$REPO" --base main --head "$BRANCH" \
+            --title "fix(deps): pin agents to ${TAG}" \
+            --body "$(printf '%s\n' \
+              "Pin eve-esa-agents to ${TAG} for the next backend release." \
+              "" \
+              "Dev keeps installing agents main. This file is what the release build passes as AGENTS_REF, and that image is what staging and prod promote.")"

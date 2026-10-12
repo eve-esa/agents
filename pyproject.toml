@@ -19,6 +19,12 @@ dependencies = [
     "tiktoken>=0.6,<1",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "build>=1,<2",
+]
+
 [project.urls]
 Homepage = "https://github.com/eve-esa/agents"
 Repository = "https://github.com/eve-esa/agents"

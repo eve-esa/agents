@@ -1,0 +1,40 @@
+# Dev tracks agents main. Every push here dispatches the backend's deploy-dev workflow
+# on the backend's main branch, passing this commit as the agents ref to install.
+# Staging and prod do not use this path: they install the tag in agents.ref, which
+# release.yml updates by opening a backend pull request.
+name: "deploy: notify backend"
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: notify-backend-dev
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  dispatch:
+    name: Dispatch backend dev
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Dispatch deploy-dev on backend main
+        env:
+          GH_TOKEN: ${{ secrets.BACKEND_DISPATCH_TOKEN }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "ERROR: BACKEND_DISPATCH_TOKEN is not set on eve-esa/agents."
+            echo "It needs actions write on eve-esa/backend so this job can dispatch deploy-dev.yml."
+            exit 1
+          fi
+          gh workflow run deploy-dev.yml \
+            --repo eve-esa/backend \
+            --ref main \
+            -f "agents-ref=${SHA}"
+          echo "Dispatched backend deploy-dev on main for agents ${SHA}"
