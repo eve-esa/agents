@@ -18,8 +18,14 @@ Use in the backend via `AGENT_GRAPH_TYPE`:
 
 - Short name `react` — ReAct loop with tools (default).
 - Short name `simple` — single LLM node, **no tools** (good for smoke tests).
+- Short name `eo_multi_agent` — EO Multi-Agent: planner, parallel domain specialists,
+  reporter and rule-based verifier (see below).
 - Fully qualified examples: `agents.graphs.react.graph.ReactAgent`,
-  `agents.graphs.simple.graph.SimpleChatAgent`.
+  `agents.graphs.simple.graph.SimpleChatAgent`,
+  `agents.graphs.eo_multi_agent.graph.EOMultiAgent`.
+
+The backend also accepts the graph per request (`"agent": "eo_multi_agent"` in the
+generation request), which makes side-by-side comparisons easy.
 
 ## Layout
 
@@ -38,6 +44,13 @@ agents/
       __init__.py
       graph.py       # SimpleChatAgent
       prompts.yaml   # shorter default prompt
+    eo_multi_agent/
+      __init__.py
+      graph.py       # EOMultiAgent
+      team.py        # which specialist owns which MCP tools
+      plan.py        # planner reply -> stages; playbooks
+      verify.py      # rule-based answer checks (numbers, artifact links)
+      prompts.yaml   # team, playbooks and the prompts of each role
 ```
 
 All imports inside `graphs/` are **relative** so this tree can be developed as its own repository.
@@ -66,6 +79,44 @@ Fault tolerance (requires ``langgraph>=1.2``) is configured inside the graph:
 
 The backend should pass ``fallback_llm`` (a bound or raw chat model) and may
 override timeout kwargs when calling ``compile``.
+
+## EO Multi-Agent (`eo_multi_agent`)
+
+One ReAct agent holding every tool works well with a large model. With a small
+one it loses track in long tool chains: it stops halfway, rewrites image links
+and states values no tool returned. EO Multi-Agent gives each model call one
+small job:
+
+```
+planner ─┬─> specialist (forest)  ─┐
+         ├─> specialist (climate) ─┼─> next stage … ─> reporter ─> verifier ─> publish
+         └─> …    in parallel     ─┘                      ^            │
+                                                          └── once ────┘ (numbers not in the evidence)
+```
+
+- **Planner** picks a *playbook* (a tested plan for a known request, declared in
+  `prompts.yaml`) or writes its own stages. Tasks in one stage run in parallel;
+  a later stage sees the reports of the earlier ones. An unusable reply falls
+  back to one *generalist* task with every tool, which behaves like `react`.
+- **Specialists** each run a small ReAct loop with only their own tools. A tool
+  belongs to the specialist whose MCP server prefixes its name
+  (`forest_compliance_eudr_check_plots` → `forest`); unclaimed tools go to the
+  specialist with server `"*"`. Each writes a factual report for the team.
+- **Reporter** writes the answer from the reports, without tools.
+- **Verifier** is rule-based, not a model: it drops image markdown (the backend
+  appends the real artifact stubs) and links to artifacts no tool produced, and
+  sends the draft back once if it holds numbers not found in the question, the
+  tool results or the reports.
+
+Only the published answer and the tool calls reach the user: internal model
+calls are tagged `nostream`, and plans, reports and drafts live in state keys
+other than `messages`. Tools run through the same tool objects the backend
+passes in, so MCP interceptors (artifact capture, latency) see every call.
+Retries and the fallback model wrap each model call, not the node, so a retry
+never repeats a specialist's tool calls.
+
+To add a specialist or a playbook, edit `agents/graphs/eo_multi_agent/prompts.yaml`;
+no code change is needed.
 
 ## Develop
 
