@@ -1,7 +1,7 @@
 """Shared utilities for agent graphs — no backend dependencies.
 
-Contains text-format tool-call parsing (Mistral/EVE-Instruct), message
-reformatting and token counting.
+Contains the clock prompt section, text-format tool-call parsing
+(Mistral/EVE-Instruct), message reformatting and token counting.
 
 Only depends on standard library + langchain-core.
 Safe to import from standalone scripts/notebooks.
@@ -9,9 +9,32 @@ Safe to import from standalone scripts/notebooks.
 
 import json
 import re
-from typing import Any, Dict, List
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 _TEXT_TOOL_CALL_MARKER = "[TOOL_CALLS]"
+
+
+# ─── Clock ────────────────────────────────────────────────────────────────────
+
+
+def clock_context(now: Optional[datetime] = None) -> str:
+    """Return the ``## Clock`` system-prompt section for the current UTC instant.
+
+    Call it on every model invocation, not at compile time, so cached graphs
+    and resumed threads do not keep the date on which they were compiled.
+    """
+    now = now or datetime.now(timezone.utc)
+    return (
+        "## Clock\n"
+        f"Current UTC timestamp: {now.isoformat(timespec='seconds')}\n"
+        f"Current UTC date: {now.date().isoformat()}\n"
+        f"Current UTC year: {now.year}\n"
+        "Use this clock for the current date/year and relative dates, "
+        "not the knowledge cutoff or dates in conversation history. "
+        "For local requests, interpret this instant in the requested "
+        "location's timezone.\n"
+    )
 
 
 # ─── Text-format tool-call parsing (Mistral / EVE-Instruct) ───────────────────

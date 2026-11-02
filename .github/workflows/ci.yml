@@ -35,4 +35,4 @@ jobs:
 
       - name: Import the shipped graphs
         run: |
-          python -c "from agents.graphs.react.graph import ReactAgent; from agents.graphs.simple.graph import SimpleChatAgent; assert ReactAgent().prompts['system'].strip(); assert SimpleChatAgent().prompts['system'].strip()"
+          python -c "from agents.graphs.react.graph import ReactAgent; from agents.graphs.simple.graph import SimpleChatAgent; from agents.graphs.deep.graph import DeepAgent; assert ReactAgent().prompts['system'].strip(); assert SimpleChatAgent().prompts['system'].strip(); assert DeepAgent().prompts['system'].strip()"

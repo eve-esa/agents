@@ -49,6 +49,17 @@ def is_node_timeout_error(exc: Any) -> bool:
     return type(exc).__name__ == "NodeTimeoutError"
 
 
+def is_timeout_error(exc: Any) -> bool:
+    """True for a stdlib ``TimeoutError`` (e.g. ``asyncio.timeout``) or ``NodeTimeoutError``."""
+    return isinstance(exc, TimeoutError) or is_node_timeout_error(exc)
+
+
+# Set to ``True`` in ``AIMessage.response_metadata`` when the fallback model
+# produced the message. Graphs without a dedicated fallback node (``deep``) use
+# it so the backend can attribute the answer to the fallback model.
+FALLBACK_MARKER = "eve_fallback_used"
+
+
 async def emit_on_policy(on_policy, **kwargs) -> None:
     """Invoke an optional backend ``on_policy`` callback; never raise to the graph."""
     if on_policy is None:

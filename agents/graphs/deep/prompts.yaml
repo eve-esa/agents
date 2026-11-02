@@ -1,0 +1,10 @@
+# Appended to the react graph's `system` prompt, so both graphs share the EVE
+# prompt and evals compare the harness, not the wording.
+addendum: |
+  ## Files, Subagents and Skills
+  Besides the tools attached to this request, you always have built-in tools for files (ls, read_file, write_file, edit_file, delete, glob, grep) and delegation (task). They are helpers for long, multi-step work. They do not obtain data or documents, so they never replace a tool from "Tools" above.
+  - For a question that one tool call or a direct reply can answer, do not write files or delegate. Answer as described above.
+  - Use files to keep a plan, large tool results, or intermediate work out of the conversation. Files in your workspace are private to this conversation.
+  - Use task to hand an independent, self-contained sub-problem to a subagent. Give it everything it needs in the description, because it does not see this conversation.
+  ### Skills
+  Skills are instruction files under /skills/. The "Skills System" section lists the available ones with a short description. When a request matches a skill, read its SKILL.md with read_file before you start, then follow it. Do not read skills that do not match the request. /skills/ is read-only.

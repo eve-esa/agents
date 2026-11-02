@@ -6,6 +6,7 @@ checkout path.
 
 ## Setup
 - Plain pip + venv (no lockfile). Dev install: `pip install -e ".[dev]"`
+- `agents.graphs.deep` needs `deepagents` and `langchain`: the `deep` extra (also in `dev`). Its tests skip without them.
 
 ## Commands
 - Test: `pytest` (single: `pytest tests/test_graphs.py::test_version_matches_pyproject`)
@@ -21,4 +22,5 @@ checkout path.
 - Imports inside `agents/graphs/` MUST be relative so that subtree can be developed as its own standalone repo.
 - Dependency pins in `pyproject.toml` are deliberately conservative (e.g. `langgraph>=1.2,<2`) so installing into a backend doesn't pull a mismatched langgraph/langchain-core. Do not loosen them casually.
 - Each graph ships `prompts.yaml` next to `graph.py`, declared as `package-data` in `pyproject.toml` — add new ones there or they won't ship in the wheel.
+- The `deep` graph customizes `create_deep_agent` only through middleware (`agents/graphs/deep/middleware.py`). Subclass a LangChain built-in and wrap the `handler` it calls rather than copying its loop. `tests/test_deep_graph.py::test_middleware_stack_snapshot` fails when a deepagents upgrade reorders the stack.
 - The version lives in `pyproject.toml` and on the `x-release-please-version` line in `agents/__init__.py`. release-please updates both from `.release-please-manifest.json`. Do not bump them by hand. The `pyproject.toml` updater rewrites that file and drops comments, so do not put notes there that have to survive a release.
