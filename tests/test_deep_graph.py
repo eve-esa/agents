@@ -92,7 +92,7 @@ def test_prompt_is_react_prompt_plus_addendum() -> None:
     react_system = ReactAgent().prompts["system"].strip()
     assert agent.name == "deep"
     assert agent.prompts["system"].startswith(react_system)
-    assert "## Files, Subagents and Skills" in agent.prompts["system"]
+    assert "## Files and Subagents" in agent.prompts["system"]
 
 
 def test_transient_error_retries_then_falls_back_with_marker() -> None:
@@ -192,72 +192,13 @@ def test_text_tool_calls_are_parsed() -> None:
     assert not any(isinstance(m, ToolMessage) for m in llm.calls[1])
 
 
-def test_system_prompt_has_clock_and_packaged_skill() -> None:
+def test_system_prompt_has_clock() -> None:
     llm = _model(ScriptedModel, AIMessage("ok"))
     asyncio.run(_run(_compile(llm)))
     system = llm.calls[0][0]
     text = system.content if isinstance(system.content, str) else str(system.content)
     assert "## Clock" in text
     assert text.index("## Clock") < text.index("You are EVE")
-    assert "eo-literature-review" in text
-
-
-def test_skills_are_readable_and_read_only() -> None:
-    llm = _model(
-        ScriptedModel,
-        AIMessage(
-            content="",
-            tool_calls=[
-                {
-                    "name": "read_file",
-                    "args": {"file_path": "/skills/eo-literature-review/SKILL.md"},
-                    "id": "r1",
-                },
-                {
-                    "name": "write_file",
-                    "args": {"file_path": "/skills/evil/SKILL.md", "content": "x"},
-                    "id": "w1",
-                },
-            ],
-        ),
-        AIMessage("done"),
-    )
-    messages = asyncio.run(_run(_compile(llm)))
-    results = {m.tool_call_id: m for m in messages if isinstance(m, ToolMessage)}
-    assert "Earth Observation literature review" in str(results["r1"].content)
-    assert "denied" in str(results["w1"].content).lower()
-    assert not (deep_graph.PACKAGED_SKILLS_DIR / "evil").exists()
-
-
-def test_skills_dir_is_argument_then_env_then_package(tmp_path, monkeypatch) -> None:
-    monkeypatch.delenv(deep_graph.SKILLS_DIR_ENV, raising=False)
-    assert deep_graph.skills_dir() == deep_graph.PACKAGED_SKILLS_DIR
-    packaged = deep_graph.default_backend().routes[deep_graph.SKILLS_ROUTE]
-    assert packaged.cwd == deep_graph.PACKAGED_SKILLS_DIR.resolve()
-
-    monkeypatch.setenv(deep_graph.SKILLS_DIR_ENV, str(tmp_path))
-    assert deep_graph.skills_dir() == tmp_path
-    from_env = deep_graph.default_backend().routes[deep_graph.SKILLS_ROUTE]
-    assert from_env.cwd == tmp_path.resolve()
-
-    explicit = tmp_path / "explicit"
-    explicit.mkdir()
-    assert deep_graph.skills_dir(explicit) == explicit
-    routed = deep_graph.default_backend(explicit).routes[deep_graph.SKILLS_ROUTE]
-    assert routed.cwd == explicit.resolve()
-
-
-def test_skills_dir_env_override(tmp_path, monkeypatch) -> None:
-    skill = tmp_path / "custom-skill"
-    skill.mkdir()
-    (skill / "SKILL.md").write_text(
-        "---\nname: custom-skill\ndescription: A custom test skill.\n---\nBody\n"
-    )
-    monkeypatch.setenv(deep_graph.SKILLS_DIR_ENV, str(tmp_path))
-    llm = _model(ScriptedModel, AIMessage("ok"))
-    asyncio.run(_run(_compile(llm)))
-    text = str(llm.calls[0][0].content)
-    assert "custom-skill" in text
     assert "eo-literature-review" not in text
 
 
@@ -288,7 +229,6 @@ def test_middleware_stack_snapshot(monkeypatch) -> None:
         "EveRetryMiddleware",
         "EveCompatMiddleware",
         "ToolErrorMiddleware",
-        "SkillsMiddleware",
         "AnthropicPromptCachingMiddleware",
         "UnsupportedContentMiddleware",
     ]
@@ -403,4 +343,5 @@ def test_general_purpose_subagent_gets_eve_middleware(monkeypatch) -> None:
             "EveCompatMiddleware",
             "ToolErrorMiddleware",
         ]
-    assert specs["general-purpose"]["skills"] == ["/skills/"]
+    assert "skills" not in specs["general-purpose"]
+    assert captured[-1]["skills"] is None

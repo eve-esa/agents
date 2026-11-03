@@ -19,7 +19,7 @@ Use in the backend via `AGENT_GRAPH_TYPE`:
 - Short name `react` — ReAct loop with tools (default).
 - Short name `simple` — single LLM node, **no tools** (good for smoke tests).
 - Short name `deep` — [Deep Agents](https://docs.langchain.com/oss/python/deepagents/overview)
-  harness with files, skills and subagents. Needs the `deep` extra:
+  harness with files and subagents. Needs the `deep` extra:
   `pip install "eve-esa-agents[deep] @ git+https://github.com/eve-esa/agents.git"`.
 - Fully qualified examples: `agents.graphs.react.graph.ReactAgent`,
   `agents.graphs.simple.graph.SimpleChatAgent`, `agents.graphs.deep.graph.DeepAgent`.
@@ -46,7 +46,6 @@ agents/
       graph.py       # DeepAgent
       middleware.py  # EVE middleware on top of LangChain built-ins
       prompts.yaml   # addendum appended to the react system prompt
-      skills/        # default skills, one directory per SKILL.md
 ```
 
 All imports inside `graphs/` are **relative** so this tree can be developed as its own repository.
@@ -111,8 +110,8 @@ with the same ``trim_messages`` settings as ``react``, so the graph never
 summarizes history. Policy events report ``node="model"``, with the model name in
 ``extra["model"]`` and the subagent name in ``extra["agent"]``.
 
-Without a ``backend``, files live in graph state and ``/skills/`` is read,
-read-only, from ``$EVE_AGENT_SKILLS_DIR`` or the packaged ``deep/skills/``.
+Without a ``backend``, files live in graph state. Skills load only when
+``compile`` is given ``skills``.
 
 ## Develop
 

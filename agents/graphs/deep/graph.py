@@ -3,7 +3,7 @@
 ``compile`` returns the ``create_deep_agent`` graph itself, so its ``model``
 node is top-level and its tokens reach a runner that streams with
 ``subgraphs=False``.  Fault tolerance and tool errors come from
-:mod:`.middleware`; files and skills come from a deepagents backend.
+:mod:`.middleware`; files come from a deepagents backend.
 
 Requires the ``deep`` extra: ``pip install "eve-esa-agents[deep]"``.
 """
@@ -11,12 +11,10 @@ Requires the ``deep`` extra: ``pip install "eve-esa-agents[deep]"``.
 from __future__ import annotations
 
 import logging
-import os
-from pathlib import Path
 from typing import Any, List, Optional, Sequence
 
 from deepagents import FilesystemPermission, create_deep_agent
-from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
+from deepagents.backends import StateBackend
 from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
 from langchain_core.tools import BaseTool
 
@@ -27,39 +25,10 @@ from .middleware import build_eve_middleware
 
 logger = logging.getLogger(__name__)
 
-SKILLS_ROUTE = "/skills/"
-SKILLS_DIR_ENV = "EVE_AGENT_SKILLS_DIR"
-PACKAGED_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 
-
-def skills_dir(directory: Optional[str | Path] = None) -> Path:
-    """Skills directory: *directory*, else ``$EVE_AGENT_SKILLS_DIR``, else packaged."""
-    root = directory or os.environ.get(SKILLS_DIR_ENV) or PACKAGED_SKILLS_DIR
-    return Path(root)
-
-
-def default_backend(skills_dir: Optional[str | Path] = None) -> CompositeBackend:
-    """Scratch files in graph state; ``/skills/`` read from a directory on disk.
-
-    The directory is *skills_dir*, else ``$EVE_AGENT_SKILLS_DIR``, else the
-    skills shipped in this package.  :func:`skills_dir` resolves it.
-    """
-    # The parameter shares the helper's name, so the helper is looked up on
-    # the module rather than bound to this argument.
-    root = globals()["skills_dir"](skills_dir)
-    return CompositeBackend(
-        default=StateBackend(),
-        routes={SKILLS_ROUTE: FilesystemBackend(root_dir=root, virtual_mode=True)},
-    )
-
-
-def default_permissions() -> List[FilesystemPermission]:
-    """Keep the on-disk skills directory read-only for the model."""
-    return [
-        FilesystemPermission(
-            operations=["write"], paths=[f"{SKILLS_ROUTE}**"], mode="deny"
-        )
-    ]
+def default_backend() -> StateBackend:
+    """Scratch files in graph state."""
+    return StateBackend()
 
 
 def _is_declarative(spec: Any) -> bool:
@@ -67,7 +36,7 @@ def _is_declarative(spec: Any) -> bool:
 
 
 class DeepAgent(AgentGraph):
-    """Deep agent: planning, files, skills and subagents on the ``create_agent`` loop.
+    """Deep agent: planning, files and subagents on the ``create_agent`` loop.
 
     Fallback, retry, run cap and ``on_policy`` events come from
     :func:`.middleware.build_eve_middleware`, attached to the main agent and to
@@ -110,8 +79,7 @@ class DeepAgent(AgentGraph):
 
         *backend*, *skills*, *subagents*, *memory*, *permissions* and *store*
         are passed to ``create_deep_agent``.  Without *backend*, the graph uses
-        :func:`default_backend` and :func:`default_permissions`; without
-        *skills*, it loads ``/skills/``.
+        :func:`default_backend`.  Skills load only when *skills* is passed.
 
         *llm_idle_timeout* is not enforced here; the provider client's read
         timeout covers stalled streams.  Each model request is trimmed to
@@ -122,10 +90,6 @@ class DeepAgent(AgentGraph):
         """
         if backend is None:
             backend = default_backend()
-            if permissions is None:
-                permissions = default_permissions()
-        if skills is None:
-            skills = [SKILLS_ROUTE]
 
         def eve_middleware(agent: Optional[str] = None):
             return build_eve_middleware(
@@ -147,14 +111,13 @@ class DeepAgent(AgentGraph):
         if not any(s.get("name") == GENERAL_PURPOSE_SUBAGENT["name"] for s in specs):
             # The auto-added general-purpose subagent would not inherit the
             # EVE middleware, so declare it explicitly.
-            specs.insert(
-                0,
-                {
-                    **GENERAL_PURPOSE_SUBAGENT,
-                    "skills": skills,
-                    "middleware": eve_middleware(GENERAL_PURPOSE_SUBAGENT["name"]),
-                },
-            )
+            general_purpose = {
+                **GENERAL_PURPOSE_SUBAGENT,
+                "middleware": eve_middleware(GENERAL_PURPOSE_SUBAGENT["name"]),
+            }
+            if skills is not None:
+                general_purpose["skills"] = skills
+            specs.insert(0, general_purpose)
 
         return create_deep_agent(
             model=llm,

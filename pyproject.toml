@@ -39,6 +39,6 @@ Repository = "https://github.com/eve-esa/agents"
 include = ["agents*"]
 
 [tool.setuptools.package-data]
-"agents.graphs.deep" = ["prompts.yaml", "skills/**/*"]
+"agents.graphs.deep" = ["prompts.yaml"]
 "agents.graphs.react" = ["prompts.yaml"]
 "agents.graphs.simple" = ["prompts.yaml"]
