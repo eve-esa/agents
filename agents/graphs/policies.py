@@ -10,6 +10,7 @@ import inspect
 import logging
 from typing import Any, Awaitable, Callable, Optional, Union
 
+from langchain_core.messages import AIMessage
 from langgraph.errors import NodeError
 from langgraph.types import Command, RetryPolicy, TimeoutPolicy
 
@@ -47,6 +48,40 @@ def is_transient_llm_error(exc: BaseException) -> bool:
 def is_node_timeout_error(exc: Any) -> bool:
     """True for LangGraph ``NodeTimeoutError`` (not a stdlib ``TimeoutError``)."""
     return type(exc).__name__ == "NodeTimeoutError"
+
+
+def is_timeout_error(exc: Any) -> bool:
+    """True for a stdlib ``TimeoutError`` (e.g. ``asyncio.timeout``) or ``NodeTimeoutError``."""
+    return isinstance(exc, TimeoutError) or is_node_timeout_error(exc)
+
+
+# Set to ``True`` in ``AIMessage.response_metadata`` when the fallback model
+# produced the message. Every graph stamps it through :func:`mark_fallback`
+# so the backend can attribute the answer to the fallback model.
+FALLBACK_MARKER = "eve_fallback_used"
+
+# Seconds the fallback model took to produce the message. Set next to
+# ``FALLBACK_MARKER``. The caller includes retries when it times across them.
+FALLBACK_LATENCY_KEY = "eve_fallback_latency_s"
+
+
+def mark_fallback(messages: Any, latency_s: float) -> None:
+    """Stamp :data:`FALLBACK_MARKER` and :data:`FALLBACK_LATENCY_KEY` on AI messages.
+
+    *messages* is one message or a sequence. Other message types are skipped.
+    *latency_s* is the fallback call that produced them.
+    """
+    if not isinstance(messages, (list, tuple)):
+        messages = [messages]
+    for message in messages:
+        if not isinstance(message, AIMessage):
+            continue
+        meta = getattr(message, "response_metadata", None)
+        if not isinstance(meta, dict):
+            message.response_metadata = {}
+            meta = message.response_metadata
+        meta[FALLBACK_MARKER] = True
+        meta[FALLBACK_LATENCY_KEY] = latency_s
 
 
 async def emit_on_policy(on_policy, **kwargs) -> None:

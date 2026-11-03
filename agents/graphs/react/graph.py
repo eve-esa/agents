@@ -6,7 +6,7 @@ relative so this tree can be cloned as its own repository.
 """
 
 import logging
-from datetime import datetime, timezone
+import time
 from typing import Any, List, Literal, Optional
 
 from langchain_core.messages import (
@@ -26,8 +26,10 @@ from ..policies import (
     build_llm_fallback_timeout_policy,
     llm_node_add_kwargs,
     make_llm_fallback_error_handler,
+    mark_fallback,
 )
 from ..utils import (
+    clock_context,
     parse_text_tool_calls,
     reformat_messages_for_text_tool_model,
     strip_content_from_tool_call_messages,
@@ -83,20 +85,7 @@ class ReactAgent(AgentGraph):
         # shared invocation logic
         async def _invoke(state: AgentMessagesState, llm_bound):
             messages = list(state["messages"])
-            # Resolve at invocation time so cached graphs and resumed threads
-            # do not keep the date on which they were compiled.
-            now = datetime.now(timezone.utc)
-            runtime_context = (
-                "## Clock\n"
-                f"Current UTC timestamp: {now.isoformat(timespec='seconds')}\n"
-                f"Current UTC date: {now.date().isoformat()}\n"
-                f"Current UTC year: {now.year}\n"
-                "Use this clock for the current date/year and relative dates, "
-                "not the knowledge cutoff or dates in conversation history. "
-                "For local requests, interpret this instant in the requested "
-                "location's timezone.\n"
-            )
-            system_instruction = runtime_context
+            system_instruction = clock_context()
             if instruction:
                 system_instruction += "\n" + instruction
             messages = [SystemMessage(content=system_instruction)] + messages
@@ -151,7 +140,12 @@ class ReactAgent(AgentGraph):
 
         # fallback agent node (no further error_handler - failures bubble)
         async def agent_fallback_fn(state: AgentMessagesState):
-            return await _invoke(state, fallback_llm_bound)
+            start = time.perf_counter()
+            result = await _invoke(state, fallback_llm_bound)
+            mark_fallback(
+                result["messages"], round(time.perf_counter() - start, 3)
+            )
+            return result
 
         # ── routing ────────────────────────────────────────────────────────
         def should_continue(state: AgentMessagesState) -> Literal["tools", "__end__"]:

@@ -18,8 +18,11 @@ Use in the backend via `AGENT_GRAPH_TYPE`:
 
 - Short name `react` — ReAct loop with tools (default).
 - Short name `simple` — single LLM node, **no tools** (good for smoke tests).
+- Short name `deep` — [Deep Agents](https://docs.langchain.com/oss/python/deepagents/overview)
+  harness with files and subagents. Needs the `deep` extra:
+  `pip install "eve-esa-agents[deep] @ git+https://github.com/eve-esa/agents.git"`.
 - Fully qualified examples: `agents.graphs.react.graph.ReactAgent`,
-  `agents.graphs.simple.graph.SimpleChatAgent`.
+  `agents.graphs.simple.graph.SimpleChatAgent`, `agents.graphs.deep.graph.DeepAgent`.
 
 ## Layout
 
@@ -38,6 +41,11 @@ agents/
       __init__.py
       graph.py       # SimpleChatAgent
       prompts.yaml   # shorter default prompt
+    deep/
+      __init__.py
+      graph.py       # DeepAgent
+      middleware.py  # EVE middleware on top of LangChain built-ins
+      prompts.yaml   # addendum appended to the react system prompt
 ```
 
 All imports inside `graphs/` are **relative** so this tree can be developed as its own repository.
@@ -66,6 +74,44 @@ Fault tolerance (requires ``langgraph>=1.2``) is configured inside the graph:
 
 The backend should pass ``fallback_llm`` (a bound or raw chat model) and may
 override timeout kwargs when calling ``compile``.
+
+## Deep agent
+
+``DeepAgent.compile`` returns the ``create_deep_agent`` graph itself, so its
+``model`` and ``tools`` nodes are top-level and tokens stream with
+``subgraphs=False``. It takes the same arguments as ``react``, plus optional
+``backend``, ``skills``, ``subagents``, ``memory``, ``permissions`` and ``store``,
+which go to ``create_deep_agent``.
+
+Fault tolerance is middleware, attached to the main agent and to every
+declarative subagent (including ``general-purpose``):
+
+- ``EveFallbackMiddleware`` — LangChain ``ModelFallbackMiddleware`` plus
+  ``on_policy`` events (``timeout`` or ``error_handler``, then ``fallback``).
+  Answers from the fallback model carry
+  ``response_metadata["eve_fallback_used"] = True`` (``FALLBACK_MARKER``) and
+  the seconds the fallback call took in
+  ``response_metadata["eve_fallback_latency_s"]`` (``FALLBACK_LATENCY_KEY``);
+  there is no ``agent_fallback`` node. Failure events carry
+  ``extra["failed_after_s"]``, the seconds the failed model spent, retries
+  included.
+- ``EveRetryMiddleware`` — LangChain ``ModelRetryMiddleware`` with the
+  ``LLM_RETRY`` settings, a per-attempt ``llm_run_timeout`` (1.5x for the
+  fallback model) and ``retry`` events. ``llm_idle_timeout`` is not enforced by
+  the graph; the provider client's read timeout covers stalled streams.
+- ``EveCompatMiddleware`` — the ``react`` clock, Mistral message clean-up and
+  ``[TOOL_CALLS]`` parsing.
+- LangChain ``ToolErrorMiddleware`` — a failing tool returns
+  ``ToolMessage(status="error", content="Tool error: ...")``.
+
+``EveTrimMiddleware`` replaces the deepagents summarization middleware on the
+main agent and every subagent. It trims each model request to ``max_tokens``
+with the same ``trim_messages`` settings as ``react``, so the graph never
+summarizes history. Policy events report ``node="model"``, with the model name in
+``extra["model"]`` and the subagent name in ``extra["agent"]``.
+
+Without a ``backend``, files live in graph state. Skills load only when
+``compile`` is given ``skills``.
 
 ## Develop
 

@@ -4,6 +4,7 @@ Useful for smoke tests and for runs where MCP tools must not be used even if
 the model supports function calling.
 """
 
+import time
 from typing import Any, List, Optional
 
 from langchain_core.messages import SystemMessage, trim_messages
@@ -18,6 +19,7 @@ from ..policies import (
     build_llm_fallback_timeout_policy,
     llm_node_add_kwargs,
     make_llm_fallback_error_handler,
+    mark_fallback,
 )
 from ..utils import tiktoken_counter
 
@@ -80,7 +82,12 @@ class SimpleChatAgent(AgentGraph):
             return await _invoke(state, llm)
 
         async def agent_fallback_fn(state: AgentMessagesState):
-            return await _invoke(state, fallback_llm)
+            start = time.perf_counter()
+            result = await _invoke(state, fallback_llm)
+            mark_fallback(
+                result["messages"], round(time.perf_counter() - start, 3)
+            )
+            return result
 
         builder = StateGraph(AgentMessagesState)
         builder.add_node(

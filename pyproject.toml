@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
+requires = ["setuptools>=62.3", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -20,9 +20,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+deep = [
+    "deepagents>=0.7.32,<0.8",
+    "langchain>=1.4.7,<2",
+]
 dev = [
     "pytest>=8,<9",
     "build>=1,<2",
+    "deepagents>=0.7.32,<0.8",
+    "langchain>=1.4.7,<2",
 ]
 
 [project.urls]
@@ -33,5 +39,6 @@ Repository = "https://github.com/eve-esa/agents"
 include = ["agents*"]
 
 [tool.setuptools.package-data]
+"agents.graphs.deep" = ["prompts.yaml"]
 "agents.graphs.react" = ["prompts.yaml"]
 "agents.graphs.simple" = ["prompts.yaml"]
