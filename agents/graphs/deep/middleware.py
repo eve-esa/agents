@@ -5,7 +5,10 @@ Built-in LangChain middleware does the work: ``ModelFallbackMiddleware``,
 keep the parent loops untouched and only wrap the ``handler`` the parent calls,
 to add what the built-ins have no hook for: backend ``on_policy`` events, the
 fallback marker and a per-attempt run cap.  ``EveCompatMiddleware`` keeps the
-``ReactAgent`` prompt and text-tool-call behaviour.
+``ReactAgent`` prompt and text-tool-call behaviour, and ``EveTrimMiddleware``
+replaces the deepagents summarization with the ``ReactAgent`` history trim.
+:func:`no_offload_filesystem` keeps the file tools but stops large messages
+from being moved into files.
 
 Events are emitted on the async path only (``astream`` / ``ainvoke``); the sync
 path runs the parent behaviour unchanged.
@@ -18,6 +21,7 @@ import logging
 import time
 from typing import Any, Awaitable, Callable, List, Optional, Sequence
 
+from deepagents import FilesystemMiddleware
 from langchain.agents.middleware import (
     AgentMiddleware,
     ModelFallbackMiddleware,
@@ -28,22 +32,28 @@ from langchain.agents.middleware import (
     ToolErrorMiddleware,
 )
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    SystemMessage,
+    ToolMessage,
+    trim_messages,
+)
 from langgraph.errors import GraphBubbleUp
 
 from ..policies import (
     DEFAULT_LLM_RUN_TIMEOUT,
     FALLBACK_LLM_TIMEOUT_MULTIPLIER,
-    FALLBACK_MARKER,
     LLM_RETRY,
     emit_on_policy,
     is_timeout_error,
+    mark_fallback,
 )
 from ..utils import (
     clock_context,
     parse_text_tool_calls,
     reformat_messages_for_text_tool_model,
     strip_content_from_tool_call_messages,
+    tiktoken_counter,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,19 +79,19 @@ def _policy_extra(model: Any, agent: Optional[str]) -> dict:
     return extra
 
 
-def _mark_fallback(response: Any) -> None:
+def _mark_fallback(response: Any, latency_s: float) -> None:
     messages = response.result if isinstance(response, ModelResponse) else [response]
-    for message in messages:
-        if isinstance(message, AIMessage):
-            message.response_metadata[FALLBACK_MARKER] = True
+    mark_fallback(messages, latency_s)
 
 
 class EveFallbackMiddleware(ModelFallbackMiddleware):
     """``ModelFallbackMiddleware`` that reports each failed model to ``on_policy``.
 
     For every failed model it emits ``timeout`` or ``error_handler``; when
-    another model follows it also emits ``fallback``.  Answers from a fallback
-    model carry ``response_metadata[FALLBACK_MARKER] = True``.  With no fallback
+    another model follows it also emits ``fallback``.  These events carry
+    ``extra["failed_after_s"]``, the seconds that model spent before failing,
+    retries included.  Answers from a fallback model are stamped with
+    :func:`agents.graphs.policies.mark_fallback`.  With no fallback
     models it still emits, then re-raises, like the ``react`` error handler.
     """
 
@@ -108,12 +118,14 @@ class EveFallbackMiddleware(ModelFallbackMiddleware):
             nonlocal calls
             calls += 1
             has_next = calls <= len(self.models)
+            start = time.perf_counter()
             try:
                 response = await handler(req)
             except GraphBubbleUp:
                 raise
             except Exception as exc:
                 extra = _policy_extra(req.model, self.agent)
+                extra["failed_after_s"] = round(time.perf_counter() - start, 3)
                 await emit_on_policy(
                     self.on_policy,
                     node=MODEL_NODE,
@@ -137,7 +149,7 @@ class EveFallbackMiddleware(ModelFallbackMiddleware):
                     )
                 raise
             if req.model is not primary:
-                _mark_fallback(response)
+                _mark_fallback(response, round(time.perf_counter() - start, 3))
             return response
 
         return await super().awrap_model_call(request, observed)
@@ -284,6 +296,58 @@ class EveCompatMiddleware(AgentMiddleware):
         return self._parse(await handler(self._prepare(request)))
 
 
+class EveTrimMiddleware(AgentMiddleware):
+    """Trim each model request to *max_tokens*, like ``ReactAgent``.
+
+    Uses the same ``trim_messages`` settings as the ``react`` agent node, with
+    the system prompt counted in the budget.  Only the request is trimmed; the
+    thread state keeps every message.
+
+    Its ``name`` replaces the deepagents ``SummarizationMiddleware`` in place,
+    on the main agent and on every declarative subagent.
+    """
+
+    def __init__(self, max_tokens: int) -> None:
+        super().__init__()
+        self.max_tokens = max_tokens
+
+    @property
+    def name(self) -> str:
+        # create_deep_agent swaps in custom middleware whose name matches a
+        # default; this is the name its summarization middleware reports.
+        return "SummarizationMiddleware"
+
+    def _trim(self, request: ModelRequest) -> ModelRequest:
+        system = request.system_message
+        messages = ([system] if system is not None else []) + list(request.messages)
+        trimmed = trim_messages(
+            messages,
+            max_tokens=self.max_tokens,
+            strategy="last",
+            token_counter=tiktoken_counter,
+            include_system=True,
+            start_on="human",
+            end_on=("human", "tool"),
+        )
+        if system is not None and trimmed and trimmed[0] is system:
+            trimmed = trimmed[1:]
+        return request.override(messages=trimmed)
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        return handler(self._trim(request))
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        return await handler(self._trim(request))
+
+
 def _with_clock(system: Optional[SystemMessage]) -> SystemMessage:
     clock = clock_context()
     if system is None:
@@ -301,20 +365,48 @@ def tool_error_message(exc: Exception, request: ToolCallRequest) -> str:
     return f"Tool error: {exc}"
 
 
+def no_offload_filesystem(backend: Any) -> FilesystemMiddleware:
+    """``FilesystemMiddleware`` that never moves message content into files.
+
+    The deepagents default saves tool results above 20000 tokens to
+    ``/large_tool_results/`` and human messages above 50000 tokens to
+    ``/conversation_history/``, leaving only a preview and a path in the
+    thread.  Both limits are off here, so every message stays whole and
+    history size is left to ``EveTrimMiddleware``.
+
+    *backend* must be the one passed to ``create_deep_agent``.  Its name
+    replaces the default ``FilesystemMiddleware`` in place, and the agent's
+    ``permissions`` are copied onto it.  Harness-profile tool description
+    overrides for the file tools are not applied.
+    """
+    return FilesystemMiddleware(
+        backend=backend,
+        tool_token_limit_before_evict=None,
+        human_message_token_limit_before_evict=None,
+    )
+
+
 def build_eve_middleware(
     *,
+    backend: Any,
+    max_tokens: int,
     fallback_llm: Optional[BaseChatModel] = None,
     run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
     on_policy: PolicyCallback = None,
     agent: Optional[str] = None,
 ) -> List[AgentMiddleware]:
-    """Return fresh EVE middleware instances, outermost first.
+    """Return fresh EVE middleware instances.
 
-    Build a new list for each agent (main and every subagent) so its policy
-    events carry that agent's label in ``extra["agent"]``.
+    :func:`no_offload_filesystem` and ``EveTrimMiddleware`` take the filesystem
+    and summarization slots of the deepagents stack; the rest run after the
+    deepagents base stack, outermost first.  Build a new list for each agent
+    (main and every subagent) so its policy events carry that agent's label in
+    ``extra["agent"]``.
     """
     fallbacks = [fallback_llm] if fallback_llm is not None else []
     return [
+        no_offload_filesystem(backend),
+        EveTrimMiddleware(max_tokens),
         EveFallbackMiddleware(*fallbacks, on_policy=on_policy, agent=agent),
         EveRetryMiddleware(
             run_timeout=run_timeout,

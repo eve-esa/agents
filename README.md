@@ -90,8 +90,12 @@ declarative subagent (including ``general-purpose``):
 - ``EveFallbackMiddleware`` — LangChain ``ModelFallbackMiddleware`` plus
   ``on_policy`` events (``timeout`` or ``error_handler``, then ``fallback``).
   Answers from the fallback model carry
-  ``response_metadata["eve_fallback_used"] = True`` (``FALLBACK_MARKER``);
-  there is no ``agent_fallback`` node.
+  ``response_metadata["eve_fallback_used"] = True`` (``FALLBACK_MARKER``) and
+  the seconds the fallback call took in
+  ``response_metadata["eve_fallback_latency_s"]`` (``FALLBACK_LATENCY_KEY``);
+  there is no ``agent_fallback`` node. Failure events carry
+  ``extra["failed_after_s"]``, the seconds the failed model spent, retries
+  included.
 - ``EveRetryMiddleware`` — LangChain ``ModelRetryMiddleware`` with the
   ``LLM_RETRY`` settings, a per-attempt ``llm_run_timeout`` (1.5x for the
   fallback model) and ``retry`` events. ``llm_idle_timeout`` is not enforced by
@@ -101,8 +105,10 @@ declarative subagent (including ``general-purpose``):
 - LangChain ``ToolErrorMiddleware`` — a failing tool returns
   ``ToolMessage(status="error", content="Tool error: ...")``.
 
-History size is handled by the deepagents summarization middleware instead of
-``trim_messages``. Policy events report ``node="model"``, with the model name in
+``EveTrimMiddleware`` replaces the deepagents summarization middleware on the
+main agent and every subagent. It trims each model request to ``max_tokens``
+with the same ``trim_messages`` settings as ``react``, so the graph never
+summarizes history. Policy events report ``node="model"``, with the model name in
 ``extra["model"]`` and the subagent name in ``extra["agent"]``.
 
 Without a ``backend``, files live in graph state and ``/skills/`` is read,

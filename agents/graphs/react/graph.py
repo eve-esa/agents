@@ -6,6 +6,7 @@ relative so this tree can be cloned as its own repository.
 """
 
 import logging
+import time
 from typing import Any, List, Literal, Optional
 
 from langchain_core.messages import (
@@ -25,6 +26,7 @@ from ..policies import (
     build_llm_fallback_timeout_policy,
     llm_node_add_kwargs,
     make_llm_fallback_error_handler,
+    mark_fallback,
 )
 from ..utils import (
     clock_context,
@@ -138,7 +140,12 @@ class ReactAgent(AgentGraph):
 
         # fallback agent node (no further error_handler - failures bubble)
         async def agent_fallback_fn(state: AgentMessagesState):
-            return await _invoke(state, fallback_llm_bound)
+            start = time.perf_counter()
+            result = await _invoke(state, fallback_llm_bound)
+            mark_fallback(
+                result["messages"], round(time.perf_counter() - start, 3)
+            )
+            return result
 
         # ── routing ────────────────────────────────────────────────────────
         def should_continue(state: AgentMessagesState) -> Literal["tools", "__end__"]:

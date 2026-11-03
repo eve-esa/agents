@@ -22,7 +22,7 @@ from langchain_core.tools import BaseTool
 
 from ..base import AgentGraph
 from ..policies import DEFAULT_LLM_IDLE_TIMEOUT, DEFAULT_LLM_RUN_TIMEOUT
-from ..react.graph import ReactAgent
+from ..react.graph import _DEFAULT_MAX_TOKENS, ReactAgent
 from .middleware import build_eve_middleware
 
 logger = logging.getLogger(__name__)
@@ -32,13 +32,21 @@ SKILLS_DIR_ENV = "EVE_AGENT_SKILLS_DIR"
 PACKAGED_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 
 
+def skills_dir(directory: Optional[str | Path] = None) -> Path:
+    """Skills directory: *directory*, else ``$EVE_AGENT_SKILLS_DIR``, else packaged."""
+    root = directory or os.environ.get(SKILLS_DIR_ENV) or PACKAGED_SKILLS_DIR
+    return Path(root)
+
+
 def default_backend(skills_dir: Optional[str | Path] = None) -> CompositeBackend:
     """Scratch files in graph state; ``/skills/`` read from a directory on disk.
 
     The directory is *skills_dir*, else ``$EVE_AGENT_SKILLS_DIR``, else the
-    skills shipped in this package.
+    skills shipped in this package.  :func:`skills_dir` resolves it.
     """
-    root = skills_dir or os.environ.get(SKILLS_DIR_ENV) or PACKAGED_SKILLS_DIR
+    # The parameter shares the helper's name, so the helper is looked up on
+    # the module rather than bound to this argument.
+    root = globals()["skills_dir"](skills_dir)
     return CompositeBackend(
         default=StateBackend(),
         routes={SKILLS_ROUTE: FilesystemBackend(root_dir=root, virtual_mode=True)},
@@ -85,6 +93,7 @@ class DeepAgent(AgentGraph):
         checkpointer: Any,
         history: Optional[List[Any]] = None,
         summary: Optional[str] = None,
+        max_tokens: int = _DEFAULT_MAX_TOKENS,
         fallback_llm=None,
         llm_run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
         llm_idle_timeout: Optional[float] = DEFAULT_LLM_IDLE_TIMEOUT,
@@ -105,8 +114,11 @@ class DeepAgent(AgentGraph):
         *skills*, it loads ``/skills/``.
 
         *llm_idle_timeout* is not enforced here; the provider client's read
-        timeout covers stalled streams.  History size is handled by the
-        deepagents summarization middleware, so ``max_tokens`` is ignored.
+        timeout covers stalled streams.  Each model request is trimmed to
+        *max_tokens* like the ``react`` graph; the deepagents summarization
+        middleware is replaced, so the graph never summarizes history.  Large
+        tool results and human messages stay in the thread instead of being
+        moved to ``/large_tool_results/`` or ``/conversation_history/``.
         """
         if backend is None:
             backend = default_backend()
@@ -117,6 +129,8 @@ class DeepAgent(AgentGraph):
 
         def eve_middleware(agent: Optional[str] = None):
             return build_eve_middleware(
+                backend=backend,
+                max_tokens=max_tokens,
                 fallback_llm=fallback_llm,
                 run_timeout=llm_run_timeout,
                 on_policy=on_policy,
