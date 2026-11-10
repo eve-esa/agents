@@ -245,11 +245,15 @@ class EveCompatMiddleware(AgentMiddleware):
     - Strips text from assistant messages that also carry tool calls
       (Mistral rejects both), and rewrites tool history as text once any tool
       call is present.
+    - Drops ``AIMessage.name`` on the request. ``create_deep_agent(name="deep")``
+      stores that name, and Mistral rejects it on an assistant message.
     - Parses ``[TOOL_CALLS]`` text output into real tool calls.
     """
 
     def _prepare(self, request: ModelRequest) -> ModelRequest:
-        messages = strip_content_from_tool_call_messages(list(request.messages))
+        messages = _without_assistant_name(
+            strip_content_from_tool_call_messages(list(request.messages))
+        )
         has_tool_history = any(
             (isinstance(m, AIMessage) and not m.content and getattr(m, "tool_calls", None))
             or isinstance(m, ToolMessage)
@@ -353,6 +357,21 @@ class EveTrimMiddleware(AgentMiddleware):
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse:
         return await handler(self._trim(request))
+
+
+def _without_assistant_name(messages: List[Any]) -> List[Any]:
+    """Copy assistant messages without ``name`` for the provider request.
+
+    The thread keeps the original. A tool message keeps its name: that field
+    is the tool, and the provider requires it.
+    """
+    cleaned: List[Any] = []
+    for message in messages:
+        if isinstance(message, AIMessage) and message.name:
+            cleaned.append(message.model_copy(update={"name": None}))
+        else:
+            cleaned.append(message)
+    return cleaned
 
 
 def _with_clock(system: Optional[SystemMessage]) -> SystemMessage:
