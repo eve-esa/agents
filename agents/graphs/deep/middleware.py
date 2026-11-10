@@ -7,8 +7,9 @@ to add what the built-ins have no hook for: backend ``on_policy`` events, the
 fallback marker and a per-attempt run cap.  ``EveCompatMiddleware`` keeps the
 ``ReactAgent`` prompt and text-tool-call behaviour, and ``EveTrimMiddleware``
 replaces the deepagents summarization with the ``ReactAgent`` history trim.
-:func:`no_offload_filesystem` keeps the file tools but stops large messages
-from being moved into files.
+:func:`offload_filesystem` writes tool results over a token limit to
+``/large_tool_results/`` and caps one ``read_file`` page at that same limit.
+Human messages stay in the thread.
 
 Events are emitted on the async path only (``astream`` / ``ainvoke``); the sync
 path runs the parent behaviour unchanged.
@@ -365,14 +366,22 @@ def tool_error_message(exc: Exception, request: ToolCallRequest) -> str:
     return f"Tool error: {exc}"
 
 
-def no_offload_filesystem(backend: Any) -> FilesystemMiddleware:
-    """``FilesystemMiddleware`` that never moves message content into files.
+# Same default as deepagents ``FilesystemMiddleware``.  About 80,000 characters.
+DEFAULT_TOOL_RESULT_MAX_TOKENS = 20_000
 
-    The deepagents default saves tool results above 20000 tokens to
-    ``/large_tool_results/`` and human messages above 50000 tokens to
-    ``/conversation_history/``, leaving only a preview and a path in the
-    thread.  Both limits are off here, so every message stays whole and
-    history size is left to ``EveTrimMiddleware``.
+
+def offload_filesystem(
+    backend: Any, tool_result_max_tokens: Optional[int]
+) -> FilesystemMiddleware:
+    """``FilesystemMiddleware`` that offloads large tool results.
+
+    A tool result above *tool_result_max_tokens* is written to
+    ``/large_tool_results/`` and replaced in the thread by its path and a
+    head-and-tail preview.  deepagents uses that same limit as the token cap
+    on one ``read_file`` page (``filesystem.py``), so a page is truncated and
+    never offloaded again.  ``None`` turns both off: every result stays whole
+    and a page has no token cap.  Human messages are never moved to
+    ``/conversation_history/``.
 
     *backend* must be the one passed to ``create_deep_agent``.  Its name
     replaces the default ``FilesystemMiddleware`` in place, and the agent's
@@ -381,7 +390,7 @@ def no_offload_filesystem(backend: Any) -> FilesystemMiddleware:
     """
     return FilesystemMiddleware(
         backend=backend,
-        tool_token_limit_before_evict=None,
+        tool_token_limit_before_evict=tool_result_max_tokens,
         human_message_token_limit_before_evict=None,
     )
 
@@ -390,6 +399,7 @@ def build_eve_middleware(
     *,
     backend: Any,
     max_tokens: int,
+    tool_result_max_tokens: Optional[int] = DEFAULT_TOOL_RESULT_MAX_TOKENS,
     fallback_llm: Optional[BaseChatModel] = None,
     run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
     on_policy: PolicyCallback = None,
@@ -397,7 +407,7 @@ def build_eve_middleware(
 ) -> List[AgentMiddleware]:
     """Return fresh EVE middleware instances.
 
-    :func:`no_offload_filesystem` and ``EveTrimMiddleware`` take the filesystem
+    :func:`offload_filesystem` and ``EveTrimMiddleware`` take the filesystem
     and summarization slots of the deepagents stack; the rest run after the
     deepagents base stack, outermost first.  Build a new list for each agent
     (main and every subagent) so its policy events carry that agent's label in
@@ -405,7 +415,7 @@ def build_eve_middleware(
     """
     fallbacks = [fallback_llm] if fallback_llm is not None else []
     return [
-        no_offload_filesystem(backend),
+        offload_filesystem(backend, tool_result_max_tokens),
         EveTrimMiddleware(max_tokens),
         EveFallbackMiddleware(*fallbacks, on_policy=on_policy, agent=agent),
         EveRetryMiddleware(

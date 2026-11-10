@@ -111,7 +111,9 @@ summarizes history. Policy events report ``node="model"``, with the model name i
 ``extra["model"]`` and the subagent name in ``extra["agent"]``.
 
 Without a ``backend``, files live in graph state. Skills load only when
-``compile`` is given ``skills``.
+``compile`` is given ``skills``. A tool result above ``tool_result_max_tokens``
+(default 20,000) is written to ``/large_tool_results/`` on that backend;
+``tool_result_max_tokens=None`` leaves every result in the thread.
 
 ## Develop
 

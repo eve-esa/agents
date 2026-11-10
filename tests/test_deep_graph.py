@@ -25,7 +25,10 @@ from langgraph.checkpoint.memory import InMemorySaver  # noqa: E402
 
 from agents.graphs.deep import DeepAgent  # noqa: E402
 from agents.graphs.deep import graph as deep_graph  # noqa: E402
-from agents.graphs.deep.middleware import EveTrimMiddleware  # noqa: E402
+from agents.graphs.deep.middleware import (  # noqa: E402
+    DEFAULT_TOOL_RESULT_MAX_TOKENS,
+    EveTrimMiddleware,
+)
 from agents.graphs.policies import FALLBACK_LATENCY_KEY, FALLBACK_MARKER  # noqa: E402
 from agents.graphs.react.graph import ReactAgent  # noqa: E402
 
@@ -252,7 +255,7 @@ def test_every_agent_trims_instead_of_summarizing(monkeypatch) -> None:
         assert isinstance(slot[0], EveTrimMiddleware)
 
 
-def test_every_agent_keeps_messages_whole(monkeypatch) -> None:
+def test_every_agent_offloads_large_tool_results(monkeypatch) -> None:
     captured = _captured_create_agent(monkeypatch)
     real = deepagents_subagents.create_agent
 
@@ -269,11 +272,11 @@ def test_every_agent_keeps_messages_whole(monkeypatch) -> None:
         slot = [m for m in kwargs["middleware"] if m.name == "FilesystemMiddleware"]
         assert len(slot) == 1
         assert slot[0].backend is backend
-        assert slot[0]._tool_token_limit_before_evict is None
+        assert slot[0]._tool_token_limit_before_evict == DEFAULT_TOOL_RESULT_MAX_TOKENS
         assert slot[0]._human_message_token_limit_before_evict is None
 
 
-def test_large_tool_result_is_not_moved_to_a_file() -> None:
+def _large_search():
     big = "chunk " * 30_000
 
     @tool
@@ -281,6 +284,11 @@ def test_large_tool_result_is_not_moved_to_a_file() -> None:
         """Returns a large result."""
         return big
 
+    return big, search
+
+
+def test_large_tool_result_is_offloaded() -> None:
+    big, search = _large_search()
     llm = _model(
         ScriptedModel,
         AIMessage(content="", tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "s1"}]),
@@ -293,8 +301,67 @@ def test_large_tool_result_is_not_moved_to_a_file() -> None:
         )
     )
     result = next(m for m in out["messages"] if isinstance(m, ToolMessage))
+    assert "/large_tool_results/s1" in result.content
+    assert big not in result.content
+    assert out["files"]["/large_tool_results/s1"]["content"] == big
+
+
+def test_tool_result_offload_can_be_turned_off() -> None:
+    big, search = _large_search()
+    llm = _model(
+        ScriptedModel,
+        AIMessage(content="", tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "s1"}]),
+        AIMessage("done"),
+    )
+    graph = _compile(llm, tools=[search], tool_result_max_tokens=None)
+    out = asyncio.run(
+        graph.ainvoke(
+            {"messages": [HumanMessage("hi")]}, {"configurable": {"thread_id": "t"}}
+        )
+    )
+    result = next(m for m in out["messages"] if isinstance(m, ToolMessage))
     assert result.content == big
     assert not any("large_tool_results" in path for path in out.get("files") or {})
+
+
+def test_offloaded_tool_result_is_read_in_pages() -> None:
+    lines = [f"line-{i:05d}" for i in range(25_000)]
+    big = "\n".join(lines)
+    path = "/large_tool_results/s1"
+
+    @tool
+    def search(q: str) -> str:
+        """Returns a large result."""
+        return big
+
+    llm = _model(
+        ScriptedModel,
+        AIMessage(content="", tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "s1"}]),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "read_file",
+                    "args": {"file_path": path, "offset": 10, "limit": 3},
+                    "id": "r1",
+                }
+            ],
+        ),
+        AIMessage("done"),
+    )
+    graph = _compile(llm, tools=[search])
+    out = asyncio.run(
+        graph.ainvoke(
+            {"messages": [HumanMessage("hi")]}, {"configurable": {"thread_id": "t"}}
+        )
+    )
+    page = next(m for m in out["messages"] if getattr(m, "tool_call_id", None) == "r1")
+    text = page.content if isinstance(page.content, str) else str(page.content)
+    assert "line-00010" in text
+    assert "line-00012" in text
+    assert "line-00009" not in text
+    assert "line-00013" not in text
+    assert len(text) < len(big)
 
 
 def test_history_is_trimmed_to_max_tokens() -> None:

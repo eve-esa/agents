@@ -21,7 +21,7 @@ from langchain_core.tools import BaseTool
 from ..base import AgentGraph
 from ..policies import DEFAULT_LLM_IDLE_TIMEOUT, DEFAULT_LLM_RUN_TIMEOUT
 from ..react.graph import _DEFAULT_MAX_TOKENS, ReactAgent
-from .middleware import build_eve_middleware
+from .middleware import DEFAULT_TOOL_RESULT_MAX_TOKENS, build_eve_middleware
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,7 @@ class DeepAgent(AgentGraph):
         history: Optional[List[Any]] = None,
         summary: Optional[str] = None,
         max_tokens: int = _DEFAULT_MAX_TOKENS,
+        tool_result_max_tokens: Optional[int] = DEFAULT_TOOL_RESULT_MAX_TOKENS,
         fallback_llm=None,
         llm_run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
         llm_idle_timeout: Optional[float] = DEFAULT_LLM_IDLE_TIMEOUT,
@@ -84,9 +85,11 @@ class DeepAgent(AgentGraph):
         *llm_idle_timeout* is not enforced here; the provider client's read
         timeout covers stalled streams.  Each model request is trimmed to
         *max_tokens* like the ``react`` graph; the deepagents summarization
-        middleware is replaced, so the graph never summarizes history.  Large
-        tool results and human messages stay in the thread instead of being
-        moved to ``/large_tool_results/`` or ``/conversation_history/``.
+        middleware is replaced, so the graph never summarizes history.  A tool
+        result above *tool_result_max_tokens* is written to
+        ``/large_tool_results/`` on *backend*, which must keep that path for
+        the life of the thread.  ``None`` leaves every result in the thread.
+        Human messages stay whole.
         """
         if backend is None:
             backend = default_backend()
@@ -95,6 +98,7 @@ class DeepAgent(AgentGraph):
             return build_eve_middleware(
                 backend=backend,
                 max_tokens=max_tokens,
+                tool_result_max_tokens=tool_result_max_tokens,
                 fallback_llm=fallback_llm,
                 run_timeout=llm_run_timeout,
                 on_policy=on_policy,
