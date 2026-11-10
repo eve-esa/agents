@@ -29,8 +29,11 @@ from langgraph.checkpoint.memory import InMemorySaver  # noqa: E402
 
 from agents.graphs.deep import DeepAgent  # noqa: E402
 from agents.graphs.deep import graph as deep_graph  # noqa: E402
+from langchain.agents.middleware import ModelRequest, ModelResponse  # noqa: E402
+
 from agents.graphs.deep.middleware import (  # noqa: E402
     DEFAULT_TOOL_RESULT_MAX_TOKENS,
+    EveCompatMiddleware,
     EveTrimMiddleware,
 )
 from agents.graphs.policies import FALLBACK_LATENCY_KEY, FALLBACK_MARKER  # noqa: E402
@@ -482,3 +485,26 @@ def test_general_purpose_subagent_gets_eve_middleware(monkeypatch) -> None:
         ]
     assert "skills" not in specs["general-purpose"]
     assert captured[-1]["skills"] is None
+
+
+def test_a_later_turn_does_not_send_the_agent_name_to_the_provider() -> None:
+    """Mistral rejects ``name`` on an assistant message. The thread keeps it."""
+    stored = AIMessage(content="previous answer", name="deep")
+    seen: dict = {}
+
+    def handler(request: ModelRequest) -> ModelResponse:
+        seen["messages"] = request.messages
+        return ModelResponse(result=[AIMessage(content="ok")])
+
+    EveCompatMiddleware().wrap_model_call(
+        ModelRequest(
+            model=_model(),
+            messages=[HumanMessage("again"), stored],
+        ),
+        handler,
+    )
+
+    sent = seen["messages"][1]
+    assert sent.name is None
+    assert sent.content == "previous answer"
+    assert stored.name == "deep"
