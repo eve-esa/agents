@@ -21,7 +21,11 @@ from langchain_core.tools import BaseTool
 from ..base import AgentGraph
 from ..policies import DEFAULT_LLM_IDLE_TIMEOUT, DEFAULT_LLM_RUN_TIMEOUT
 from ..react.graph import _DEFAULT_MAX_TOKENS, ReactAgent
-from .middleware import DEFAULT_TOOL_RESULT_MAX_TOKENS, build_eve_middleware
+from .middleware import (
+    DEFAULT_TOOL_RESULT_MAX_TOKENS,
+    build_eve_middleware,
+    filesystem_keeping_offload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,11 +89,12 @@ class DeepAgent(AgentGraph):
         *llm_idle_timeout* is not enforced here; the provider client's read
         timeout covers stalled streams.  Each model request is trimmed to
         *max_tokens* like the ``react`` graph; the deepagents summarization
-        middleware is replaced, so the graph never summarizes history.  A tool
-        result above *tool_result_max_tokens* is written to
+        middleware is replaced, so the graph never summarizes history.          A tool
+        result above *tool_result_max_tokens* tiktoken tokens is written to
         ``/large_tool_results/`` on *backend*, which must keep that path for
         the life of the thread.  ``None`` leaves every result in the thread.
-        Human messages stay whole.
+        A subagent's own ``FilesystemMiddleware`` keeps its backend and
+        permissions, and still uses this limit.  Human messages stay whole.
         """
         if backend is None:
             backend = default_backend()
@@ -109,7 +114,12 @@ class DeepAgent(AgentGraph):
         for spec in subagents or []:
             if _is_declarative(spec):
                 merged = {m.name: m for m in eve_middleware(spec["name"])}
-                merged.update({m.name: m for m in spec.get("middleware", [])})
+                for middleware in spec.get("middleware", []):
+                    if getattr(middleware, "name", None) == "FilesystemMiddleware":
+                        middleware = filesystem_keeping_offload(
+                            middleware, tool_result_max_tokens
+                        )
+                    merged[middleware.name] = middleware
                 spec = {**spec, "middleware": list(merged.values())}
             specs.append(spec)
         if not any(s.get("name") == GENERAL_PURPOSE_SUBAGENT["name"] for s in specs):

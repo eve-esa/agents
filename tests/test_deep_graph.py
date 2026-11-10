@@ -11,6 +11,10 @@ pytest.importorskip("deepagents")
 
 import deepagents.graph as deepagents_graph  # noqa: E402
 import deepagents.middleware.subagents as deepagents_subagents  # noqa: E402
+from deepagents.middleware.filesystem import (  # noqa: E402
+    FilesystemMiddleware,
+    FilesystemPermission,
+)
 from langchain_core.language_models.fake_chat_models import (  # noqa: E402
     FakeMessagesListChatModel,
 )
@@ -304,6 +308,71 @@ def test_large_tool_result_is_offloaded() -> None:
     assert "/large_tool_results/s1" in result.content
     assert big not in result.content
     assert out["files"]["/large_tool_results/s1"]["content"] == big
+
+
+def test_dense_tool_result_is_offloaded_by_tiktoken() -> None:
+    """CJK is one token per character. The character estimate would keep this.
+
+    120 characters is under the deepagents budget of 4 characters per token
+    (200 at a limit of 50) and over 50 tiktoken tokens.  Forty lines means the
+    head-and-tail preview cannot hold the whole result.
+    """
+    dense = "你你\n" * 40
+
+    @tool
+    def search(q: str) -> str:
+        """Returns a dense result."""
+        return dense
+
+    llm = _model(
+        ScriptedModel,
+        AIMessage(content="", tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "s1"}]),
+        AIMessage("done"),
+    )
+    graph = _compile(llm, tools=[search], tool_result_max_tokens=50)
+    out = asyncio.run(
+        graph.ainvoke(
+            {"messages": [HumanMessage("hi")]}, {"configurable": {"thread_id": "t"}}
+        )
+    )
+    result = next(m for m in out["messages"] if isinstance(m, ToolMessage))
+    assert "/large_tool_results/s1" in result.content
+    assert dense not in result.content
+    assert out["files"]["/large_tool_results/s1"]["content"] == dense
+
+
+def test_subagent_filesystem_keeps_backend_and_offload_limit(monkeypatch) -> None:
+    captured = _captured_create_agent(monkeypatch)
+    real = deepagents_subagents.create_agent
+
+    def spy(model, **kwargs):
+        captured.append(kwargs)
+        return real(model, **kwargs)
+
+    monkeypatch.setattr(deepagents_subagents, "create_agent", spy)
+    other = deep_graph.StateBackend()
+    permission = FilesystemPermission(operations=["read"], paths=["/notes/**"], mode="allow")
+    custom = {
+        "name": "researcher",
+        "description": "Researches.",
+        "system_prompt": "Research.",
+        "middleware": [
+            FilesystemMiddleware(
+                backend=other,
+                tool_token_limit_before_evict=None,
+                human_message_token_limit_before_evict=5,
+                permissions=[permission],
+            )
+        ],
+    }
+    _compile(_model(), subagents=[custom], tool_result_max_tokens=1234)
+    researcher = next(kwargs for kwargs in captured if kwargs.get("system_prompt") == "Research.")
+    slot = [m for m in researcher["middleware"] if m.name == "FilesystemMiddleware"]
+    assert len(slot) == 1
+    assert slot[0].backend is other
+    assert slot[0]._permissions == [permission]
+    assert slot[0]._tool_token_limit_before_evict == 1234
+    assert slot[0]._human_message_token_limit_before_evict is None
 
 
 def test_tool_result_offload_can_be_turned_off() -> None:

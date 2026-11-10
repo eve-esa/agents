@@ -112,7 +112,8 @@ summarizes history. Policy events report ``node="model"``, with the model name i
 
 Without a ``backend``, files live in graph state. Skills load only when
 ``compile`` is given ``skills``. A tool result above ``tool_result_max_tokens``
-(default 20,000) is written to ``/large_tool_results/`` on that backend;
+(default 20,000, counted with the same tiktoken counter as the history trim)
+is written to ``/large_tool_results/`` on that backend;
 ``tool_result_max_tokens=None`` leaves every result in the thread.
 
 ## Develop
