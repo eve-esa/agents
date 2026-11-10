@@ -7,8 +7,9 @@ to add what the built-ins have no hook for: backend ``on_policy`` events, the
 fallback marker and a per-attempt run cap.  ``EveCompatMiddleware`` keeps the
 ``ReactAgent`` prompt and text-tool-call behaviour, and ``EveTrimMiddleware``
 replaces the deepagents summarization with the ``ReactAgent`` history trim.
-:func:`no_offload_filesystem` keeps the file tools but stops large messages
-from being moved into files.
+:func:`offload_filesystem` writes tool results over a tiktoken limit to
+``/large_tool_results/``.  The same limit is the deepagents character cap on
+one ``read_file`` page.  Human messages stay in the thread.
 
 Events are emitted on the async path only (``astream`` / ``ainvoke``); the sync
 path runs the parent behaviour unchanged.
@@ -22,6 +23,11 @@ import time
 from typing import Any, Awaitable, Callable, List, Optional, Sequence
 
 from deepagents import FilesystemMiddleware
+from deepagents.middleware._message_eviction import (
+    _aoffload_tool_message_content,
+    _extract_text_from_message,
+    _offload_tool_message_content,
+)
 from langchain.agents.middleware import (
     AgentMiddleware,
     ModelFallbackMiddleware,
@@ -34,6 +40,7 @@ from langchain.agents.middleware import (
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
+    HumanMessage,
     SystemMessage,
     ToolMessage,
     trim_messages,
@@ -365,31 +372,121 @@ def tool_error_message(exc: Exception, request: ToolCallRequest) -> str:
     return f"Tool error: {exc}"
 
 
-def no_offload_filesystem(backend: Any) -> FilesystemMiddleware:
-    """``FilesystemMiddleware`` that never moves message content into files.
+# Same default as deepagents ``FilesystemMiddleware``.
+DEFAULT_TOOL_RESULT_MAX_TOKENS = 20_000
 
-    The deepagents default saves tool results above 20000 tokens to
-    ``/large_tool_results/`` and human messages above 50000 tokens to
-    ``/conversation_history/``, leaving only a preview and a path in the
-    thread.  Both limits are off here, so every message stays whole and
-    history size is left to ``EveTrimMiddleware``.
 
-    *backend* must be the one passed to ``create_deep_agent``.  Its name
-    replaces the default ``FilesystemMiddleware`` in place, and the agent's
-    ``permissions`` are copied onto it.  Harness-profile tool description
-    overrides for the file tools are not applied.
+def _content_tokens(text: str) -> int:
+    """Token count of *text* with the same counter the history trim uses.
+
+    :func:`tiktoken_counter` adds 4 per message.  Those are not part of the
+    tool result, so they come back off.
     """
-    return FilesystemMiddleware(
-        backend=backend,
-        tool_token_limit_before_evict=None,
-        human_message_token_limit_before_evict=None,
+    return max(0, tiktoken_counter([HumanMessage(content=text)]) - 4)
+
+
+class EveFilesystemMiddleware(FilesystemMiddleware):
+    """``FilesystemMiddleware`` that offloads by :func:`tiktoken_counter`.
+
+    deepagents decides from ``len(text) / 4``.  That leaves dense text, such
+    as CJK, inline while it is already over the token budget
+    ``EveTrimMiddleware`` uses.  A result over *tool_result_max_tokens* real
+    tokens is written to ``/large_tool_results/`` here.  A result under that
+    count still goes through the parent, so a long ASCII result offloads on
+    the character estimate too.
+
+    The parent also uses this limit as the character cap of one ``read_file``
+    page (about 4 characters per token).  ``None`` turns both off.  Human
+    messages are never moved to ``/conversation_history/``.
+
+    The instance name stays ``FilesystemMiddleware``, so it replaces the
+    deepagents default in place.  ``create_deep_agent`` copies the agent's
+    permissions onto it.  Harness-profile tool description overrides for the
+    file tools are not applied.
+    """
+
+    def __init__(self, backend: Any, tool_result_max_tokens: Optional[int]) -> None:
+        super().__init__(
+            backend=backend,
+            tool_token_limit_before_evict=tool_result_max_tokens,
+            human_message_token_limit_before_evict=None,
+        )
+
+    @property
+    def name(self) -> str:
+        return "FilesystemMiddleware"
+
+    def _offload_over_budget(self, message: ToolMessage, resolved_backend: Any, *, sync: bool):
+        if not self._tool_token_limit_before_evict:
+            return None
+        content = _extract_text_from_message(message)
+        if _content_tokens(content) <= self._tool_token_limit_before_evict:
+            return None
+        offload = _offload_tool_message_content if sync else _aoffload_tool_message_content
+        return offload(message, content, resolved_backend, self._large_tool_results_prefix)
+
+    def _process_large_message(self, message: ToolMessage, resolved_backend: Any):
+        offloaded = self._offload_over_budget(message, resolved_backend, sync=True)
+        if offloaded is None and _content_tokens(_extract_text_from_message(message)) > (
+            self._tool_token_limit_before_evict or 0
+        ):
+            return message, False
+        if offloaded is not None:
+            return offloaded, True
+        return super()._process_large_message(message, resolved_backend)
+
+    async def _aprocess_large_message(self, message: ToolMessage, resolved_backend: Any):
+        offloaded = self._offload_over_budget(message, resolved_backend, sync=False)
+        if offloaded is not None:
+            offloaded = await offloaded
+        over = _content_tokens(_extract_text_from_message(message)) > (
+            self._tool_token_limit_before_evict or 0
+        )
+        if offloaded is None and over:
+            return message, False
+        if offloaded is not None:
+            return offloaded, True
+        return await super()._aprocess_large_message(message, resolved_backend)
+
+
+def offload_filesystem(
+    backend: Any, tool_result_max_tokens: Optional[int]
+) -> EveFilesystemMiddleware:
+    """Filesystem middleware for one agent.  See :class:`EveFilesystemMiddleware`."""
+    return EveFilesystemMiddleware(backend, tool_result_max_tokens)
+
+
+def filesystem_keeping_offload(
+    middleware: Any, tool_result_max_tokens: Optional[int]
+) -> FilesystemMiddleware:
+    """Keep *middleware*'s backend and permissions, and apply this graph's limit.
+
+    A declarative subagent can pass its own ``FilesystemMiddleware``.  The
+    merge replaces the EVE one by name, which would drop
+    *tool_result_max_tokens* and the tiktoken check.  Rebuild it so the
+    graph's limit still applies.
+    """
+    if (
+        isinstance(middleware, EveFilesystemMiddleware)
+        and middleware._tool_token_limit_before_evict == tool_result_max_tokens
+        and middleware._human_message_token_limit_before_evict is None
+    ):
+        return middleware
+    rebuilt = EveFilesystemMiddleware(
+        backend=getattr(middleware, "backend", None),
+        tool_result_max_tokens=tool_result_max_tokens,
     )
+    permissions = list(getattr(middleware, "_permissions", []) or [])
+    if permissions:
+        return rebuilt._with_permissions(permissions)
+    return rebuilt
 
 
 def build_eve_middleware(
     *,
     backend: Any,
     max_tokens: int,
+    tool_result_max_tokens: Optional[int] = DEFAULT_TOOL_RESULT_MAX_TOKENS,
     fallback_llm: Optional[BaseChatModel] = None,
     run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
     on_policy: PolicyCallback = None,
@@ -397,7 +494,7 @@ def build_eve_middleware(
 ) -> List[AgentMiddleware]:
     """Return fresh EVE middleware instances.
 
-    :func:`no_offload_filesystem` and ``EveTrimMiddleware`` take the filesystem
+    :func:`offload_filesystem` and ``EveTrimMiddleware`` take the filesystem
     and summarization slots of the deepagents stack; the rest run after the
     deepagents base stack, outermost first.  Build a new list for each agent
     (main and every subagent) so its policy events carry that agent's label in
@@ -405,7 +502,7 @@ def build_eve_middleware(
     """
     fallbacks = [fallback_llm] if fallback_llm is not None else []
     return [
-        no_offload_filesystem(backend),
+        offload_filesystem(backend, tool_result_max_tokens),
         EveTrimMiddleware(max_tokens),
         EveFallbackMiddleware(*fallbacks, on_policy=on_policy, agent=agent),
         EveRetryMiddleware(

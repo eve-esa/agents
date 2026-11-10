@@ -11,6 +11,10 @@ pytest.importorskip("deepagents")
 
 import deepagents.graph as deepagents_graph  # noqa: E402
 import deepagents.middleware.subagents as deepagents_subagents  # noqa: E402
+from deepagents.middleware.filesystem import (  # noqa: E402
+    FilesystemMiddleware,
+    FilesystemPermission,
+)
 from langchain_core.language_models.fake_chat_models import (  # noqa: E402
     FakeMessagesListChatModel,
 )
@@ -25,7 +29,10 @@ from langgraph.checkpoint.memory import InMemorySaver  # noqa: E402
 
 from agents.graphs.deep import DeepAgent  # noqa: E402
 from agents.graphs.deep import graph as deep_graph  # noqa: E402
-from agents.graphs.deep.middleware import EveTrimMiddleware  # noqa: E402
+from agents.graphs.deep.middleware import (  # noqa: E402
+    DEFAULT_TOOL_RESULT_MAX_TOKENS,
+    EveTrimMiddleware,
+)
 from agents.graphs.policies import FALLBACK_LATENCY_KEY, FALLBACK_MARKER  # noqa: E402
 from agents.graphs.react.graph import ReactAgent  # noqa: E402
 
@@ -231,6 +238,7 @@ def test_middleware_stack_snapshot(monkeypatch) -> None:
         "ToolErrorMiddleware",
         "AnthropicPromptCachingMiddleware",
         "UnsupportedContentMiddleware",
+        "ModelRefusalMiddleware",
     ]
 
 
@@ -252,7 +260,7 @@ def test_every_agent_trims_instead_of_summarizing(monkeypatch) -> None:
         assert isinstance(slot[0], EveTrimMiddleware)
 
 
-def test_every_agent_keeps_messages_whole(monkeypatch) -> None:
+def test_every_agent_offloads_large_tool_results(monkeypatch) -> None:
     captured = _captured_create_agent(monkeypatch)
     real = deepagents_subagents.create_agent
 
@@ -269,11 +277,11 @@ def test_every_agent_keeps_messages_whole(monkeypatch) -> None:
         slot = [m for m in kwargs["middleware"] if m.name == "FilesystemMiddleware"]
         assert len(slot) == 1
         assert slot[0].backend is backend
-        assert slot[0]._tool_token_limit_before_evict is None
+        assert slot[0]._tool_token_limit_before_evict == DEFAULT_TOOL_RESULT_MAX_TOKENS
         assert slot[0]._human_message_token_limit_before_evict is None
 
 
-def test_large_tool_result_is_not_moved_to_a_file() -> None:
+def _large_search():
     big = "chunk " * 30_000
 
     @tool
@@ -281,6 +289,11 @@ def test_large_tool_result_is_not_moved_to_a_file() -> None:
         """Returns a large result."""
         return big
 
+    return big, search
+
+
+def test_large_tool_result_is_offloaded() -> None:
+    big, search = _large_search()
     llm = _model(
         ScriptedModel,
         AIMessage(content="", tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "s1"}]),
@@ -293,8 +306,132 @@ def test_large_tool_result_is_not_moved_to_a_file() -> None:
         )
     )
     result = next(m for m in out["messages"] if isinstance(m, ToolMessage))
+    assert "/large_tool_results/s1" in result.content
+    assert big not in result.content
+    assert out["files"]["/large_tool_results/s1"]["content"] == big
+
+
+def test_dense_tool_result_is_offloaded_by_tiktoken() -> None:
+    """CJK is one token per character. The character estimate would keep this.
+
+    120 characters is under the deepagents budget of 4 characters per token
+    (200 at a limit of 50) and over 50 tiktoken tokens.  Forty lines means the
+    head-and-tail preview cannot hold the whole result.
+    """
+    dense = "你你\n" * 40
+
+    @tool
+    def search(q: str) -> str:
+        """Returns a dense result."""
+        return dense
+
+    llm = _model(
+        ScriptedModel,
+        AIMessage(content="", tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "s1"}]),
+        AIMessage("done"),
+    )
+    graph = _compile(llm, tools=[search], tool_result_max_tokens=50)
+    out = asyncio.run(
+        graph.ainvoke(
+            {"messages": [HumanMessage("hi")]}, {"configurable": {"thread_id": "t"}}
+        )
+    )
+    result = next(m for m in out["messages"] if isinstance(m, ToolMessage))
+    assert "/large_tool_results/s1" in result.content
+    assert dense not in result.content
+    assert out["files"]["/large_tool_results/s1"]["content"] == dense
+
+
+def test_subagent_filesystem_keeps_backend_and_offload_limit(monkeypatch) -> None:
+    captured = _captured_create_agent(monkeypatch)
+    real = deepagents_subagents.create_agent
+
+    def spy(model, **kwargs):
+        captured.append(kwargs)
+        return real(model, **kwargs)
+
+    monkeypatch.setattr(deepagents_subagents, "create_agent", spy)
+    other = deep_graph.StateBackend()
+    permission = FilesystemPermission(operations=["read"], paths=["/notes/**"], mode="allow")
+    custom = {
+        "name": "researcher",
+        "description": "Researches.",
+        "system_prompt": "Research.",
+        "middleware": [
+            FilesystemMiddleware(
+                backend=other,
+                tool_token_limit_before_evict=None,
+                human_message_token_limit_before_evict=5,
+                permissions=[permission],
+            )
+        ],
+    }
+    _compile(_model(), subagents=[custom], tool_result_max_tokens=1234)
+    researcher = next(kwargs for kwargs in captured if kwargs.get("system_prompt") == "Research.")
+    slot = [m for m in researcher["middleware"] if m.name == "FilesystemMiddleware"]
+    assert len(slot) == 1
+    assert slot[0].backend is other
+    assert slot[0]._permissions == [permission]
+    assert slot[0]._tool_token_limit_before_evict == 1234
+    assert slot[0]._human_message_token_limit_before_evict is None
+
+
+def test_tool_result_offload_can_be_turned_off() -> None:
+    big, search = _large_search()
+    llm = _model(
+        ScriptedModel,
+        AIMessage(content="", tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "s1"}]),
+        AIMessage("done"),
+    )
+    graph = _compile(llm, tools=[search], tool_result_max_tokens=None)
+    out = asyncio.run(
+        graph.ainvoke(
+            {"messages": [HumanMessage("hi")]}, {"configurable": {"thread_id": "t"}}
+        )
+    )
+    result = next(m for m in out["messages"] if isinstance(m, ToolMessage))
     assert result.content == big
     assert not any("large_tool_results" in path for path in out.get("files") or {})
+
+
+def test_offloaded_tool_result_is_read_in_pages() -> None:
+    lines = [f"line-{i:05d}" for i in range(25_000)]
+    big = "\n".join(lines)
+    path = "/large_tool_results/s1"
+
+    @tool
+    def search(q: str) -> str:
+        """Returns a large result."""
+        return big
+
+    llm = _model(
+        ScriptedModel,
+        AIMessage(content="", tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "s1"}]),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "read_file",
+                    "args": {"file_path": path, "offset": 10, "limit": 3},
+                    "id": "r1",
+                }
+            ],
+        ),
+        AIMessage("done"),
+    )
+    graph = _compile(llm, tools=[search])
+    out = asyncio.run(
+        graph.ainvoke(
+            {"messages": [HumanMessage("hi")]}, {"configurable": {"thread_id": "t"}}
+        )
+    )
+    page = next(m for m in out["messages"] if getattr(m, "tool_call_id", None) == "r1")
+    text = page.content if isinstance(page.content, str) else str(page.content)
+    assert "line-00010" in text
+    assert "line-00012" in text
+    assert "line-00009" not in text
+    assert "line-00013" not in text
+    assert len(text) < len(big)
 
 
 def test_history_is_trimmed_to_max_tokens() -> None:
