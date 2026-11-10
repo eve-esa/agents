@@ -21,13 +21,13 @@ dependencies = [
 
 [project.optional-dependencies]
 deep = [
-    "deepagents>=0.7.32,<0.8",
+    "deepagents>=0.7.35,<0.8",
     "langchain>=1.4.7,<2",
 ]
 dev = [
     "pytest>=8,<9",
     "build>=1,<2",
-    "deepagents>=0.7.32,<0.8",
+    "deepagents>=0.7.35,<0.8",
     "langchain>=1.4.7,<2",
 ]
 

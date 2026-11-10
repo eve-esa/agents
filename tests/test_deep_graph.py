@@ -238,6 +238,7 @@ def test_middleware_stack_snapshot(monkeypatch) -> None:
         "ToolErrorMiddleware",
         "AnthropicPromptCachingMiddleware",
         "UnsupportedContentMiddleware",
+        "ModelRefusalMiddleware",
     ]
 
 
