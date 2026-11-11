@@ -513,6 +513,74 @@ def test_over_the_trigger_summarizes_and_keeps_the_tail() -> None:
     assert newer in stored
 
 
+def test_the_summary_message_carries_the_text_and_range() -> None:
+    llm = _model(ScriptedModel, AIMessage("first summary"), AIMessage("ok"))
+    graph = _compile(llm, context_window=_WINDOW)
+    asyncio.run(
+        graph.ainvoke(
+            {
+                "messages": [
+                    HumanMessage("oldfact " * 8_000, additional_kwargs={"eve_message_id": "a"}),
+                    AIMessage("x"),
+                    HumanMessage("newerfact " * 8_000, additional_kwargs={"eve_message_id": "b"}),
+                    AIMessage("y"),
+                    HumanMessage("q", additional_kwargs={"eve_message_id": "c"}),
+                ]
+            },
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+    event = graph.get_state({"configurable": {"thread_id": "t"}}).values[
+        "_summarization_event"
+    ]
+    extra = event["summary_message"].additional_kwargs
+    assert extra["eve_summary"] == "first summary"
+    assert extra["eve_summary_first_message_id"] == "a"
+    assert extra["eve_summary_last_message_id"] == "b"
+
+
+def test_a_second_summary_keeps_the_start_of_the_first_range() -> None:
+    llm = _model(
+        ScriptedModel,
+        AIMessage("first summary"),
+        AIMessage("ok"),
+        AIMessage("second summary"),
+        AIMessage("ok again"),
+    )
+    graph = _compile(llm, context_window=_WINDOW)
+    config = {"configurable": {"thread_id": "t"}}
+    asyncio.run(
+        graph.ainvoke(
+            {
+                "messages": [
+                    HumanMessage("oldfact " * 8_000, additional_kwargs={"eve_message_id": "a"}),
+                    AIMessage("x"),
+                    HumanMessage("newerfact " * 8_000, additional_kwargs={"eve_message_id": "b"}),
+                    AIMessage("y"),
+                    HumanMessage("q", additional_kwargs={"eve_message_id": "c"}),
+                ]
+            },
+            config,
+        )
+    )
+    asyncio.run(
+        graph.ainvoke(
+            {
+                "messages": [
+                    HumanMessage("laterfact " * 14_000, additional_kwargs={"eve_message_id": "d"}),
+                ]
+            },
+            config,
+        )
+    )
+    extra = graph.get_state(config).values["_summarization_event"][
+        "summary_message"
+    ].additional_kwargs
+    assert extra["eve_summary"] == "second summary"
+    assert extra["eve_summary_first_message_id"] == "a"
+    assert extra["eve_summary_last_message_id"] in {"c", "d"}
+
+
 def test_old_write_file_args_are_cut_before_summarizing() -> None:
     llm = _model(ScriptedModel, AIMessage("ok"))
     graph = _compile(llm, context_window=_WINDOW, truncate_args_max_chars=2_000)

@@ -318,6 +318,11 @@ DEFAULT_SUMMARY_KEEP_FRACTION = 0.10
 DEFAULT_SUMMARY_MAX_TOKENS = 2_000
 DEFAULT_TRUNCATE_ARGS_MAX_CHARS = 2_000
 DEFAULT_MESSAGE_ID_KEY = "eve_message_id"
+# ``additional_kwargs`` of the summary message.  The caller can store the
+# summary and the range it covers without parsing the message text.
+SUMMARY_TEXT_KEY = "eve_summary"
+SUMMARY_FIRST_ID_KEY = "eve_summary_first_message_id"
+SUMMARY_LAST_ID_KEY = "eve_summary_last_message_id"
 
 # Messages the in-flight summarization is about to replace.  ``wrap_model_call``
 # partitions and then builds the summary message on the same task.
@@ -418,15 +423,20 @@ class EveSummarizationMiddleware(SummarizationMiddleware):
         return parts
 
     def _covered_ids(self, messages: Optional[List[Any]]) -> List[str]:
+        """``message_id_key`` values of the summarized human messages.
+
+        A summary from an earlier compaction is folded into the new one, so
+        its own range counts as covered too.
+        """
         found: List[str] = []
         for message in messages or []:
             if not isinstance(message, HumanMessage):
                 continue
-            value = (getattr(message, "additional_kwargs", None) or {}).get(
-                self._message_id_key
-            )
-            if value:
-                found.append(str(value))
+            extra = getattr(message, "additional_kwargs", None) or {}
+            for key in (SUMMARY_FIRST_ID_KEY, SUMMARY_LAST_ID_KEY, self._message_id_key):
+                value = extra.get(key)
+                if value:
+                    found.append(str(value))
         return found
 
     def _id_range_line(self, ids: List[str]) -> Optional[str]:
@@ -445,7 +455,8 @@ class EveSummarizationMiddleware(SummarizationMiddleware):
     def _build_new_messages_with_path(
         self, summary: str, file_path: Optional[str]
     ) -> List[Any]:
-        range_line = self._id_range_line(self._covered_ids(_summarized_messages.get()))
+        ids = self._covered_ids(_summarized_messages.get())
+        range_line = self._id_range_line(ids)
         # The history file is on the sandbox.  A recall note points at the
         # stored messages instead, which outlive that sandbox.
         if self._recall_note:
@@ -463,12 +474,11 @@ class EveSummarizationMiddleware(SummarizationMiddleware):
         lines.append(
             f"A condensed summary follows:\n\n<summary>\n{summary}\n</summary>"
         )
-        return [
-            HumanMessage(
-                content="\n\n".join(lines),
-                additional_kwargs={"lc_source": "summarization"},
-            )
-        ]
+        extra: dict = {"lc_source": "summarization", SUMMARY_TEXT_KEY: summary}
+        if ids:
+            extra[SUMMARY_FIRST_ID_KEY] = ids[0]
+            extra[SUMMARY_LAST_ID_KEY] = ids[-1]
+        return [HumanMessage(content="\n\n".join(lines), additional_kwargs=extra)]
 
 
 def _without_assistant_name(messages: List[Any]) -> List[Any]:
