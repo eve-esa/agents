@@ -47,6 +47,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langgraph.config import get_stream_writer
 from langgraph.errors import GraphBubbleUp
 
 from ..policies import (
@@ -323,6 +324,8 @@ DEFAULT_MESSAGE_ID_KEY = "eve_message_id"
 SUMMARY_TEXT_KEY = "eve_summary"
 SUMMARY_FIRST_ID_KEY = "eve_summary_first_message_id"
 SUMMARY_LAST_ID_KEY = "eve_summary_last_message_id"
+# ``event`` value of the custom stream payload written around a summary call.
+SUMMARY_STREAM_EVENT = "eve_summarization"
 
 # Messages the in-flight summarization is about to replace.  ``wrap_model_call``
 # partitions and then builds the summary message on the same task.
@@ -379,6 +382,10 @@ class EveSummarizationMiddleware(SummarizationMiddleware):
     ``summary_prompt`` replaces the deepagents prompt; it must contain
     ``{messages}``.  System messages in the older part are not sent to the
     summarizer, so a summary never restates an instruction.
+
+    Around the summary call it writes ``custom`` stream payloads with
+    ``event`` set to ``SUMMARY_STREAM_EVENT`` and ``phase`` ``started``, then
+    ``finished`` (also on error), so a client can show that it is summarizing.
     """
 
     def __init__(
@@ -435,6 +442,36 @@ class EveSummarizationMiddleware(SummarizationMiddleware):
         to_summarize = [m for m in to_summarize if not isinstance(m, SystemMessage)]
         _summarized_messages.set(list(to_summarize))
         return to_summarize, preserved
+
+    def _write_summary_event(self, phase: str, messages: List[Any]) -> None:
+        """Write a ``custom`` stream payload; a no-op outside a graph run."""
+        try:
+            writer = get_stream_writer()
+        except (RuntimeError, KeyError):
+            return
+        ids = self._covered_ids(messages)
+        writer(
+            {
+                "event": SUMMARY_STREAM_EVENT,
+                "phase": phase,
+                "first_message_id": ids[0] if ids else None,
+                "last_message_id": ids[-1] if ids else None,
+            }
+        )
+
+    def _create_summary(self, messages_to_summarize: List[Any]) -> str:
+        self._write_summary_event("started", messages_to_summarize)
+        try:
+            return super()._create_summary(messages_to_summarize)
+        finally:
+            self._write_summary_event("finished", messages_to_summarize)
+
+    async def _acreate_summary(self, messages_to_summarize: List[Any]) -> str:
+        self._write_summary_event("started", messages_to_summarize)
+        try:
+            return await super()._acreate_summary(messages_to_summarize)
+        finally:
+            self._write_summary_event("finished", messages_to_summarize)
 
     def _covered_ids(self, messages: Optional[List[Any]]) -> List[str]:
         """``message_id_key`` values of the summarized human messages.

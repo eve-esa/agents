@@ -631,6 +631,36 @@ def test_system_messages_are_not_summarized() -> None:
     assert "RULE-ZX9" not in prompt
 
 
+def test_the_summary_call_is_announced_on_the_custom_stream() -> None:
+    llm = _model(ScriptedModel, AIMessage("summary"), AIMessage("ok"))
+    graph = _compile(llm, context_window=_WINDOW)
+
+    async def collect() -> List[Any]:
+        events = []
+        async for chunk in graph.astream(
+            {
+                "messages": [
+                    HumanMessage("oldfact " * 8_000, additional_kwargs={"eve_message_id": "a"}),
+                    AIMessage("x"),
+                    HumanMessage("q", additional_kwargs={"eve_message_id": "b"}),
+                ]
+            },
+            {"configurable": {"thread_id": "t"}},
+            stream_mode="custom",
+        ):
+            events.append(chunk)
+        return events
+
+    events = [e for e in asyncio.run(collect()) if e.get("event") == "eve_summarization"]
+    assert [e["phase"] for e in events] == ["started", "finished"]
+    assert events[0]["first_message_id"] == "a"
+
+
+def test_a_summary_outside_a_graph_run_writes_nothing() -> None:
+    middleware = EveSummarizationMiddleware(_model(), StateBackend(), context_window=_WINDOW)
+    middleware._write_summary_event("started", [HumanMessage("x")])
+
+
 def test_a_prompt_without_the_messages_slot_is_refused() -> None:
     with pytest.raises(ValueError):
         EveSummarizationMiddleware(
