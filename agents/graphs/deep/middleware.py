@@ -5,8 +5,9 @@ Built-in LangChain middleware does the work: ``ModelFallbackMiddleware``,
 keep the parent loops untouched and only wrap the ``handler`` the parent calls,
 to add what the built-ins have no hook for: backend ``on_policy`` events, the
 fallback marker and a per-attempt run cap.  ``EveCompatMiddleware`` keeps the
-``ReactAgent`` prompt and text-tool-call behaviour, and ``EveTrimMiddleware``
-replaces the deepagents summarization with the ``ReactAgent`` history trim.
+``ReactAgent`` prompt and text-tool-call behaviour, and
+``EveSummarizationMiddleware`` replaces the deepagents summarization with
+one whose trigger and tail are fractions of a known context window.
 :func:`offload_filesystem` writes tool results over a tiktoken limit to
 ``/large_tool_results/``.  The same limit is the deepagents character cap on
 one ``read_file`` page.  Human messages stay in the thread.
@@ -20,9 +21,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextvars import ContextVar
 from typing import Any, Awaitable, Callable, List, Optional, Sequence
 
 from deepagents import FilesystemMiddleware
+from deepagents.middleware.summarization import SummarizationMiddleware
 from deepagents.middleware._message_eviction import (
     _aoffload_tool_message_content,
     _extract_text_from_message,
@@ -43,8 +46,8 @@ from langchain_core.messages import (
     HumanMessage,
     SystemMessage,
     ToolMessage,
-    trim_messages,
 )
+from langgraph.config import get_stream_writer
 from langgraph.errors import GraphBubbleUp
 
 from ..policies import (
@@ -307,56 +310,226 @@ class EveCompatMiddleware(AgentMiddleware):
         return self._parse(await handler(self._prepare(request)))
 
 
-class EveTrimMiddleware(AgentMiddleware):
-    """Trim each model request to *max_tokens*, like ``ReactAgent``.
+# The chat models have no ``profile.max_input_tokens``, so the fractions
+# below are turned into token counts against this window.  Deep Agents would
+# otherwise fall back to a 170,000 token trigger.
+DEFAULT_CONTEXT_WINDOW = 128_000
+DEFAULT_SUMMARY_TRIGGER_FRACTION = 0.85
+DEFAULT_SUMMARY_KEEP_FRACTION = 0.10
+DEFAULT_SUMMARY_MAX_TOKENS = 2_000
+DEFAULT_TRUNCATE_ARGS_MAX_CHARS = 2_000
+DEFAULT_MESSAGE_ID_KEY = "eve_message_id"
+# ``additional_kwargs`` of the summary message.  The caller can store the
+# summary and the range it covers without parsing the message text.
+SUMMARY_TEXT_KEY = "eve_summary"
+SUMMARY_FIRST_ID_KEY = "eve_summary_first_message_id"
+SUMMARY_LAST_ID_KEY = "eve_summary_last_message_id"
+# ``event`` value of the custom stream payload written around a summary call.
+SUMMARY_STREAM_EVENT = "eve_summarization"
 
-    Uses the same ``trim_messages`` settings as the ``react`` agent node, with
-    the system prompt counted in the budget.  Only the request is trimmed; the
-    thread state keeps every message.
+# Messages the in-flight summarization is about to replace.  ``wrap_model_call``
+# partitions and then builds the summary message on the same task.
+_summarized_messages: ContextVar[Optional[List[Any]]] = ContextVar(
+    "eve_summarized_messages", default=None
+)
+
+
+def _token_budget(context_window: int, fraction: float) -> int:
+    """Token count for *fraction* of *context_window*.
+
+    Deep Agents rejects a token threshold of zero, so a fraction that rounds
+    to zero is an error rather than a silent full-history summary.
+    """
+    if context_window <= 0:
+        raise ValueError(f"context_window must be positive, got {context_window}.")
+    if not 0 < fraction <= 1:
+        raise ValueError(f"fraction must be in (0, 1], got {fraction}.")
+    tokens = int(context_window * fraction)
+    if tokens <= 0:
+        raise ValueError(
+            f"context_window {context_window} times {fraction} rounds to 0 tokens."
+        )
+    return tokens
+
+
+def _capped_summarizer(model: BaseChatModel, summary_max_tokens: int) -> BaseChatModel:
+    """The graph model, with its completion capped at *summary_max_tokens*.
+
+    A model with no ``max_tokens`` field is returned unchanged.  The copy does
+    not replace the model that answers the user.
+    """
+    fields = getattr(type(model), "model_fields", None)
+    if not isinstance(fields, dict) or "max_tokens" not in fields:
+        return model
+    return model.model_copy(update={"max_tokens": summary_max_tokens})
+
+
+class EveSummarizationMiddleware(SummarizationMiddleware):
+    """Summarize older history once the prompt fills most of the window.
 
     Its ``name`` replaces the deepagents ``SummarizationMiddleware`` in place,
-    on the main agent and on every declarative subagent.
+    on the main agent and on every declarative subagent.  Trigger and keep are
+    token counts, ``context_window`` times the fractions.  ``write_file`` and
+    ``edit_file`` arguments in the older part are shortened first; the parent
+    summarizes only when the prompt is still over the trigger.  The cut keeps
+    each tool call with its results.  The thread keeps every message.
+
+    The summary message names the ``message_id_key`` values of the first and
+    last summarized human message.  When ``recall_note`` is set it is appended
+    and the ``/conversation_history/`` path is left out: that file lives only
+    as long as the thread.
+
+    ``summary_prompt`` replaces the deepagents prompt; it must contain
+    ``{messages}``.  System messages in the older part are not sent to the
+    summarizer, so a summary never restates an instruction.
+
+    Around the summary call it writes ``custom`` stream payloads with
+    ``event`` set to ``SUMMARY_STREAM_EVENT`` and ``phase`` ``started``, then
+    ``finished`` (also on error), so a client can show that it is summarizing.
     """
 
-    def __init__(self, max_tokens: int) -> None:
-        super().__init__()
-        self.max_tokens = max_tokens
+    def __init__(
+        self,
+        model: BaseChatModel,
+        backend: Any,
+        *,
+        context_window: int = DEFAULT_CONTEXT_WINDOW,
+        summary_trigger_fraction: float = DEFAULT_SUMMARY_TRIGGER_FRACTION,
+        summary_keep_fraction: float = DEFAULT_SUMMARY_KEEP_FRACTION,
+        summary_max_tokens: int = DEFAULT_SUMMARY_MAX_TOKENS,
+        truncate_args_max_chars: int = DEFAULT_TRUNCATE_ARGS_MAX_CHARS,
+        recall_note: Optional[str] = None,
+        message_id_key: str = DEFAULT_MESSAGE_ID_KEY,
+        summary_prompt: Optional[str] = None,
+    ) -> None:
+        trigger = ("tokens", _token_budget(context_window, summary_trigger_fraction))
+        keep = ("tokens", _token_budget(context_window, summary_keep_fraction))
+        prompt_kwargs: dict = {}
+        if summary_prompt:
+            if "{messages}" not in summary_prompt:
+                raise ValueError("summary_prompt must contain {messages}.")
+            prompt_kwargs["summary_prompt"] = summary_prompt
+        super().__init__(
+            **prompt_kwargs,
+            model=_capped_summarizer(model, summary_max_tokens),
+            backend=backend,
+            trigger=trigger,
+            keep=keep,
+            # The constructor default keeps only the last 4,000 tokens of the
+            # older part.  The whole older part is what the summary covers.
+            trim_tokens_to_summarize=None,
+            truncate_args_settings={
+                "trigger": trigger,
+                "keep": keep,
+                "max_length": truncate_args_max_chars,
+            },
+        )
+        self._recall_note = (recall_note or "").strip()
+        self._message_id_key = message_id_key
 
     @property
     def name(self) -> str:
-        # create_deep_agent swaps in custom middleware whose name matches a
-        # default; this is the name its summarization middleware reports.
+        # A subclass of the deepagents middleware reports its class name.
+        # create_deep_agent only swaps the default when the names match.
         return "SummarizationMiddleware"
 
-    def _trim(self, request: ModelRequest) -> ModelRequest:
-        system = request.system_message
-        messages = ([system] if system is not None else []) + list(request.messages)
-        trimmed = trim_messages(
-            messages,
-            max_tokens=self.max_tokens,
-            strategy="last",
-            token_counter=tiktoken_counter,
-            include_system=True,
-            start_on="human",
-            end_on=("human", "tool"),
+    def _partition_messages(
+        self, conversation_messages: List[Any], cutoff_index: int
+    ) -> tuple:
+        to_summarize, preserved = super()._partition_messages(
+            conversation_messages, cutoff_index
         )
-        if system is not None and trimmed and trimmed[0] is system:
-            trimmed = trimmed[1:]
-        return request.override(messages=trimmed)
+        to_summarize = [m for m in to_summarize if not isinstance(m, SystemMessage)]
+        _summarized_messages.set(list(to_summarize))
+        return to_summarize, preserved
 
-    def wrap_model_call(
-        self,
-        request: ModelRequest,
-        handler: Callable[[ModelRequest], ModelResponse],
-    ) -> ModelResponse:
-        return handler(self._trim(request))
+    def _write_summary_event(self, phase: str, messages: List[Any]) -> None:
+        """Write a ``custom`` stream payload; a no-op outside a graph run."""
+        try:
+            writer = get_stream_writer()
+        except (RuntimeError, KeyError):
+            return
+        ids = self._covered_ids(messages)
+        writer(
+            {
+                "event": SUMMARY_STREAM_EVENT,
+                "phase": phase,
+                "first_message_id": ids[0] if ids else None,
+                "last_message_id": ids[-1] if ids else None,
+            }
+        )
 
-    async def awrap_model_call(
-        self,
-        request: ModelRequest,
-        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
-    ) -> ModelResponse:
-        return await handler(self._trim(request))
+    def _create_summary(self, messages_to_summarize: List[Any]) -> str:
+        self._write_summary_event("started", messages_to_summarize)
+        try:
+            return super()._create_summary(messages_to_summarize)
+        finally:
+            self._write_summary_event("finished", messages_to_summarize)
+
+    async def _acreate_summary(self, messages_to_summarize: List[Any]) -> str:
+        self._write_summary_event("started", messages_to_summarize)
+        try:
+            return await super()._acreate_summary(messages_to_summarize)
+        finally:
+            self._write_summary_event("finished", messages_to_summarize)
+
+    def _covered_ids(self, messages: Optional[List[Any]]) -> List[str]:
+        """``message_id_key`` values of the summarized human messages.
+
+        A summary from an earlier compaction is folded into the new one, so
+        its own range counts as covered too.
+        """
+        found: List[str] = []
+        for message in messages or []:
+            if not isinstance(message, HumanMessage):
+                continue
+            extra = getattr(message, "additional_kwargs", None) or {}
+            for key in (SUMMARY_FIRST_ID_KEY, SUMMARY_LAST_ID_KEY, self._message_id_key):
+                value = extra.get(key)
+                if value:
+                    found.append(str(value))
+        return found
+
+    def _id_range_line(self, ids: List[str]) -> Optional[str]:
+        if not ids:
+            return None
+        if ids[0] == ids[-1]:
+            return (
+                f"Summarized message_id {ids[0]}. "
+                "Pass it to read_history to read the raw messages."
+            )
+        return (
+            f"Summarized message_id {ids[0]} through {ids[-1]}. "
+            "Pass either id to read_history to read the raw messages."
+        )
+
+    def _build_new_messages_with_path(
+        self, summary: str, file_path: Optional[str]
+    ) -> List[Any]:
+        ids = self._covered_ids(_summarized_messages.get())
+        range_line = self._id_range_line(ids)
+        # The history file lives only as long as the thread.  A recall note
+        # points at the stored messages instead, which outlive it.
+        if self._recall_note:
+            file_path = None
+        lines = ["You are in the middle of a conversation that has been summarized."]
+        if file_path is not None:
+            lines.append(
+                "The full conversation history has been saved to "
+                f"{file_path} should you need to refer back to it for details."
+            )
+        if range_line is not None:
+            lines.append(range_line)
+        if self._recall_note:
+            lines.append(self._recall_note)
+        lines.append(
+            f"A condensed summary follows:\n\n<summary>\n{summary}\n</summary>"
+        )
+        extra: dict = {"lc_source": "summarization", SUMMARY_TEXT_KEY: summary}
+        if ids:
+            extra[SUMMARY_FIRST_ID_KEY] = ids[0]
+            extra[SUMMARY_LAST_ID_KEY] = ids[-1]
+        return [HumanMessage(content="\n\n".join(lines), additional_kwargs=extra)]
 
 
 def _without_assistant_name(messages: List[Any]) -> List[Any]:
@@ -396,7 +569,7 @@ DEFAULT_TOOL_RESULT_MAX_TOKENS = 20_000
 
 
 def _content_tokens(text: str) -> int:
-    """Token count of *text* with the same counter the history trim uses.
+    """Token count of *text* with the same counter the offload decision uses.
 
     :func:`tiktoken_counter` adds 4 per message.  Those are not part of the
     tool result, so they come back off.
@@ -408,8 +581,8 @@ class EveFilesystemMiddleware(FilesystemMiddleware):
     """``FilesystemMiddleware`` that offloads by :func:`tiktoken_counter`.
 
     deepagents decides from ``len(text) / 4``.  That leaves dense text, such
-    as CJK, inline while it is already over the token budget
-    ``EveTrimMiddleware`` uses.  A result over *tool_result_max_tokens* real
+    as CJK, inline while it is already over the token budget the
+    summarization trigger uses.  A result over *tool_result_max_tokens* real
     tokens is written to ``/large_tool_results/`` here.  A result under that
     count still goes through the parent, so a long ASCII result offloads on
     the character estimate too.
@@ -504,7 +677,15 @@ def filesystem_keeping_offload(
 def build_eve_middleware(
     *,
     backend: Any,
-    max_tokens: int,
+    model: BaseChatModel,
+    context_window: int = DEFAULT_CONTEXT_WINDOW,
+    summary_trigger_fraction: float = DEFAULT_SUMMARY_TRIGGER_FRACTION,
+    summary_keep_fraction: float = DEFAULT_SUMMARY_KEEP_FRACTION,
+    summary_max_tokens: int = DEFAULT_SUMMARY_MAX_TOKENS,
+    truncate_args_max_chars: int = DEFAULT_TRUNCATE_ARGS_MAX_CHARS,
+    recall_note: Optional[str] = None,
+    message_id_key: str = DEFAULT_MESSAGE_ID_KEY,
+    summary_prompt: Optional[str] = None,
     tool_result_max_tokens: Optional[int] = DEFAULT_TOOL_RESULT_MAX_TOKENS,
     fallback_llm: Optional[BaseChatModel] = None,
     run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
@@ -513,16 +694,27 @@ def build_eve_middleware(
 ) -> List[AgentMiddleware]:
     """Return fresh EVE middleware instances.
 
-    :func:`offload_filesystem` and ``EveTrimMiddleware`` take the filesystem
-    and summarization slots of the deepagents stack; the rest run after the
-    deepagents base stack, outermost first.  Build a new list for each agent
-    (main and every subagent) so its policy events carry that agent's label in
-    ``extra["agent"]``.
+    :func:`offload_filesystem` and ``EveSummarizationMiddleware`` take the
+    filesystem and summarization slots of the deepagents stack; the rest run
+    after the deepagents base stack, outermost first.  Build a new list for
+    each agent (main and every subagent) so its policy events carry that
+    agent's label in ``extra["agent"]``.
     """
     fallbacks = [fallback_llm] if fallback_llm is not None else []
     return [
         offload_filesystem(backend, tool_result_max_tokens),
-        EveTrimMiddleware(max_tokens),
+        EveSummarizationMiddleware(
+            model,
+            backend,
+            context_window=context_window,
+            summary_trigger_fraction=summary_trigger_fraction,
+            summary_keep_fraction=summary_keep_fraction,
+            summary_max_tokens=summary_max_tokens,
+            truncate_args_max_chars=truncate_args_max_chars,
+            recall_note=recall_note,
+            message_id_key=message_id_key,
+            summary_prompt=summary_prompt,
+        ),
         EveFallbackMiddleware(*fallbacks, on_policy=on_policy, agent=agent),
         EveRetryMiddleware(
             run_timeout=run_timeout,

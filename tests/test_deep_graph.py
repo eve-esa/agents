@@ -11,6 +11,7 @@ pytest.importorskip("deepagents")
 
 import deepagents.graph as deepagents_graph  # noqa: E402
 import deepagents.middleware.subagents as deepagents_subagents  # noqa: E402
+from deepagents.backends import StateBackend  # noqa: E402
 from deepagents.middleware.filesystem import (  # noqa: E402
     FilesystemMiddleware,
     FilesystemPermission,
@@ -34,7 +35,7 @@ from langchain.agents.middleware import ModelRequest, ModelResponse  # noqa: E40
 from agents.graphs.deep.middleware import (  # noqa: E402
     DEFAULT_TOOL_RESULT_MAX_TOKENS,
     EveCompatMiddleware,
-    EveTrimMiddleware,
+    EveSummarizationMiddleware,
 )
 from agents.graphs.policies import FALLBACK_LATENCY_KEY, FALLBACK_MARKER  # noqa: E402
 from agents.graphs.react.graph import ReactAgent  # noqa: E402
@@ -245,7 +246,7 @@ def test_middleware_stack_snapshot(monkeypatch) -> None:
     ]
 
 
-def test_every_agent_trims_instead_of_summarizing(monkeypatch) -> None:
+def test_every_agent_summarizes_with_the_eve_middleware(monkeypatch) -> None:
     captured = _captured_create_agent(monkeypatch)
     real = deepagents_subagents.create_agent
 
@@ -260,7 +261,7 @@ def test_every_agent_trims_instead_of_summarizing(monkeypatch) -> None:
     for kwargs in captured:
         slot = [m for m in kwargs["middleware"] if m.name == "SummarizationMiddleware"]
         assert len(slot) == 1
-        assert isinstance(slot[0], EveTrimMiddleware)
+        assert isinstance(slot[0], EveSummarizationMiddleware)
 
 
 def test_every_agent_offloads_large_tool_results(monkeypatch) -> None:
@@ -437,26 +438,343 @@ def test_offloaded_tool_result_is_read_in_pages() -> None:
     assert len(text) < len(big)
 
 
-def test_history_is_trimmed_to_max_tokens() -> None:
+def _text(message: Any) -> str:
+    content = message.content
+    return content if isinstance(content, str) else str(content)
+
+
+def _joined(messages: List[Any]) -> str:
+    return "\n".join(_text(message) for message in messages)
+
+
+# Small enough that one long turn crosses 0.85 of it, and large enough that
+# the system prompt plus the built-in tool schemas stay under that line.
+_WINDOW = 20_000
+
+
+def test_short_history_is_not_summarized() -> None:
     llm = _model(ScriptedModel, AIMessage("ok"))
-    graph = _compile(llm, max_tokens=20_000)
-    old = "old " * 40_000
+    graph = _compile(llm)
+    out = asyncio.run(
+        graph.ainvoke(
+            {"messages": [HumanMessage("new question")]},
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+    assert len(llm.calls) == 1
+    sent = llm.calls[0]
+    assert isinstance(sent[0], SystemMessage)
+    assert "been summarized" not in _joined(sent)
+    assert [m.content for m in sent[1:]] == ["new question"]
+    assert any(getattr(m, "content", None) == "new question" for m in out["messages"])
+
+
+def test_over_the_trigger_summarizes_and_keeps_the_tail() -> None:
+    llm = _model(ScriptedModel, AIMessage("kept the decision"), AIMessage("ok"))
+    graph = _compile(
+        llm,
+        context_window=_WINDOW,
+        recall_note="Use search_history to recover a dropped fact.",
+    )
+    old = "oldfact " * 8_000
+    newer = "newerfact " * 8_000
     asyncio.run(
         graph.ainvoke(
             {
                 "messages": [
-                    HumanMessage(old),
+                    HumanMessage(old, additional_kwargs={"eve_message_id": "id-old"}),
                     AIMessage("old answer"),
+                    HumanMessage(newer, additional_kwargs={"eve_message_id": "id-new"}),
+                    AIMessage("second answer"),
+                    HumanMessage(
+                        "new question", additional_kwargs={"eve_message_id": "id-tail"}
+                    ),
+                ]
+            },
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+    assert len(llm.calls) == 2
+    sent = llm.calls[1]
+    body = _joined(sent)
+    assert isinstance(sent[0], SystemMessage)
+    assert isinstance(sent[1], HumanMessage)
+    assert sent[1].additional_kwargs.get("lc_source") == "summarization"
+    assert "kept the decision" in _text(sent[1])
+    assert "Summarized message_id id-old through id-new." in _text(sent[1])
+    assert "Use search_history to recover a dropped fact." in _text(sent[1])
+    assert "/conversation_history/" not in _text(sent[1])
+    assert "new question" in body
+    assert old not in body
+    assert newer not in body
+    stored = _joined(
+        graph.get_state({"configurable": {"thread_id": "t"}}).values["messages"]
+    )
+    assert old in stored
+    assert newer in stored
+
+
+def test_the_summary_message_carries_the_text_and_range() -> None:
+    llm = _model(ScriptedModel, AIMessage("first summary"), AIMessage("ok"))
+    graph = _compile(llm, context_window=_WINDOW)
+    asyncio.run(
+        graph.ainvoke(
+            {
+                "messages": [
+                    HumanMessage("oldfact " * 8_000, additional_kwargs={"eve_message_id": "a"}),
+                    AIMessage("x"),
+                    HumanMessage("newerfact " * 8_000, additional_kwargs={"eve_message_id": "b"}),
+                    AIMessage("y"),
+                    HumanMessage("q", additional_kwargs={"eve_message_id": "c"}),
+                ]
+            },
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+    event = graph.get_state({"configurable": {"thread_id": "t"}}).values[
+        "_summarization_event"
+    ]
+    extra = event["summary_message"].additional_kwargs
+    assert extra["eve_summary"] == "first summary"
+    assert extra["eve_summary_first_message_id"] == "a"
+    assert extra["eve_summary_last_message_id"] == "b"
+
+
+def test_a_second_summary_keeps_the_start_of_the_first_range() -> None:
+    llm = _model(
+        ScriptedModel,
+        AIMessage("first summary"),
+        AIMessage("ok"),
+        AIMessage("second summary"),
+        AIMessage("ok again"),
+    )
+    graph = _compile(llm, context_window=_WINDOW)
+    config = {"configurable": {"thread_id": "t"}}
+    asyncio.run(
+        graph.ainvoke(
+            {
+                "messages": [
+                    HumanMessage("oldfact " * 8_000, additional_kwargs={"eve_message_id": "a"}),
+                    AIMessage("x"),
+                    HumanMessage("newerfact " * 8_000, additional_kwargs={"eve_message_id": "b"}),
+                    AIMessage("y"),
+                    HumanMessage("q", additional_kwargs={"eve_message_id": "c"}),
+                ]
+            },
+            config,
+        )
+    )
+    asyncio.run(
+        graph.ainvoke(
+            {
+                "messages": [
+                    HumanMessage("laterfact " * 14_000, additional_kwargs={"eve_message_id": "d"}),
+                ]
+            },
+            config,
+        )
+    )
+    extra = graph.get_state(config).values["_summarization_event"][
+        "summary_message"
+    ].additional_kwargs
+    assert extra["eve_summary"] == "second summary"
+    assert extra["eve_summary_first_message_id"] == "a"
+    assert extra["eve_summary_last_message_id"] in {"c", "d"}
+
+
+def _summarizer_prompt(llm) -> str:
+    """Text the summarization call received: the first recorded call."""
+    first = llm.calls[0]
+    return "\n".join(str(m.content) for m in first)
+
+
+def test_the_summarizer_uses_the_eve_prompt() -> None:
+    llm = _model(ScriptedModel, AIMessage("summary"), AIMessage("ok"))
+    graph = _compile(llm, context_window=_WINDOW)
+    asyncio.run(
+        graph.ainvoke(
+            {
+                "messages": [
+                    HumanMessage("oldfact " * 8_000, additional_kwargs={"eve_message_id": "a"}),
+                    AIMessage("x"),
+                    HumanMessage("q", additional_kwargs={"eve_message_id": "b"}),
+                ]
+            },
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+    prompt = _summarizer_prompt(llm)
+    assert "the Earth Observation assistant of ESA" in prompt
+    assert "## Facts and values" in prompt
+    assert "SESSION INTENT" not in prompt
+    assert "oldfact" in prompt
+
+
+def test_system_messages_are_not_summarized() -> None:
+    llm = _model(ScriptedModel, AIMessage("summary"), AIMessage("ok"))
+    graph = _compile(llm, context_window=_WINDOW)
+    asyncio.run(
+        graph.ainvoke(
+            {
+                "messages": [
+                    SystemMessage("RULE-ZX9: always cite sources."),
+                    HumanMessage("oldfact " * 8_000, additional_kwargs={"eve_message_id": "a"}),
+                    AIMessage("x"),
+                    HumanMessage("q", additional_kwargs={"eve_message_id": "b"}),
+                ]
+            },
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+    prompt = _summarizer_prompt(llm)
+    assert "oldfact" in prompt
+    assert "RULE-ZX9" not in prompt
+
+
+def test_the_summary_call_is_announced_on_the_custom_stream() -> None:
+    llm = _model(ScriptedModel, AIMessage("summary"), AIMessage("ok"))
+    graph = _compile(llm, context_window=_WINDOW)
+
+    async def collect() -> List[Any]:
+        events = []
+        async for chunk in graph.astream(
+            {
+                "messages": [
+                    HumanMessage("oldfact " * 8_000, additional_kwargs={"eve_message_id": "a"}),
+                    AIMessage("x"),
+                    HumanMessage("q", additional_kwargs={"eve_message_id": "b"}),
+                ]
+            },
+            {"configurable": {"thread_id": "t"}},
+            stream_mode="custom",
+        ):
+            events.append(chunk)
+        return events
+
+    events = [e for e in asyncio.run(collect()) if e.get("event") == "eve_summarization"]
+    assert [e["phase"] for e in events] == ["started", "finished"]
+    assert events[0]["first_message_id"] == "a"
+
+
+def test_a_summary_outside_a_graph_run_writes_nothing() -> None:
+    middleware = EveSummarizationMiddleware(_model(), StateBackend(), context_window=_WINDOW)
+    middleware._write_summary_event("started", [HumanMessage("x")])
+
+
+def test_a_prompt_without_the_messages_slot_is_refused() -> None:
+    with pytest.raises(ValueError):
+        EveSummarizationMiddleware(
+            _model(), StateBackend(), context_window=_WINDOW, summary_prompt="no slot"
+        )
+
+
+def test_old_write_file_args_are_cut_before_summarizing() -> None:
+    llm = _model(ScriptedModel, AIMessage("ok"))
+    graph = _compile(llm, context_window=_WINDOW, truncate_args_max_chars=2_000)
+    old_body = "Z" * 80_000
+    recent_body = "Q" * 5_000
+    asyncio.run(
+        graph.ainvoke(
+            {
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "write_file",
+                                "args": {"file_path": "old.py", "content": old_body},
+                                "id": "w1",
+                            }
+                        ],
+                    ),
+                    ToolMessage(content="wrote old", tool_call_id="w1"),
+                    HumanMessage("recent"),
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "write_file",
+                                "args": {"file_path": "new.py", "content": recent_body},
+                                "id": "w2",
+                            }
+                        ],
+                    ),
+                    ToolMessage(content="wrote new", tool_call_id="w2"),
+                ]
+            },
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+    assert len(llm.calls) == 1
+    # EveCompat rewrites tool calls as text before the model sees them.
+    body = _joined(llm.calls[0])
+    assert "been summarized" not in body
+    assert "Z" * 80_000 not in body
+    assert "Z" * 20 in body
+    assert "argument truncated" in body
+    assert recent_body in body
+
+
+def test_a_tool_batch_is_not_split() -> None:
+    llm = _model(ScriptedModel, AIMessage("batch summary"), AIMessage("ok"))
+    graph = _compile(llm, context_window=_WINDOW, summary_keep_fraction=0.02)
+    old = "oldfact " * 12_000
+    asyncio.run(
+        graph.ainvoke(
+            {
+                "messages": [
+                    HumanMessage(old, additional_kwargs={"eve_message_id": "id-old"}),
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {"name": "search", "args": {}, "id": "c1"},
+                            {"name": "search", "args": {}, "id": "c2"},
+                        ],
+                    ),
+                    ToolMessage(content="result-one", tool_call_id="c1"),
+                    ToolMessage(content="result-two", tool_call_id="c2"),
                     HumanMessage("new question"),
                 ]
             },
             {"configurable": {"thread_id": "t"}},
         )
     )
-    sent = llm.calls[0]
-    assert isinstance(sent[0], SystemMessage)
-    assert "You are EVE" in str(sent[0].content)
-    assert [m.content for m in sent[1:]] == ["new question"]
+    body = _joined(llm.calls[-1])
+    assert old not in body
+    assert "result-one" in body
+    assert "result-two" in body
+    calls = [message for message in llm.calls[-1] if "[TOOL_CALLS]" in _text(message)]
+    assert len(calls) == 1
+    assert _text(calls[0]).count('"name": "search"') == 2
+
+
+def test_an_offloaded_result_stays_a_stub_in_the_summary_input() -> None:
+    llm = _model(ScriptedModel, AIMessage("saw the stub"), AIMessage("ok"))
+    graph = _compile(llm, context_window=_WINDOW)
+    payload = "PAYLOAD " * 4_000
+    stub = "Result saved to /large_tool_results/s1. Preview: station."
+    asyncio.run(
+        graph.ainvoke(
+            {
+                "messages": [
+                    HumanMessage(
+                        "lookup", additional_kwargs={"eve_message_id": "id-tool"}
+                    ),
+                    AIMessage(
+                        content="",
+                        tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "s1"}],
+                    ),
+                    ToolMessage(content=stub, tool_call_id="s1", name="search"),
+                    HumanMessage("oldfact " * 8_000),
+                    HumanMessage("new question"),
+                ]
+            },
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+    summary_input = _joined(llm.calls[0])
+    assert stub in summary_input
+    assert payload not in summary_input
 
 
 def test_general_purpose_subagent_gets_eve_middleware(monkeypatch) -> None:

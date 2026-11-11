@@ -20,9 +20,15 @@ from langchain_core.tools import BaseTool
 
 from ..base import AgentGraph
 from ..policies import DEFAULT_LLM_IDLE_TIMEOUT, DEFAULT_LLM_RUN_TIMEOUT
-from ..react.graph import _DEFAULT_MAX_TOKENS, ReactAgent
+from ..react.graph import ReactAgent
 from .middleware import (
+    DEFAULT_CONTEXT_WINDOW,
+    DEFAULT_MESSAGE_ID_KEY,
+    DEFAULT_SUMMARY_KEEP_FRACTION,
+    DEFAULT_SUMMARY_MAX_TOKENS,
+    DEFAULT_SUMMARY_TRIGGER_FRACTION,
     DEFAULT_TOOL_RESULT_MAX_TOKENS,
+    DEFAULT_TRUNCATE_ARGS_MAX_CHARS,
     build_eve_middleware,
     filesystem_keeping_offload,
 )
@@ -47,7 +53,8 @@ class DeepAgent(AgentGraph):
     every declarative subagent, including ``general-purpose``.
 
     The system prompt is the ``react`` prompt followed by ``addendum`` from this
-    graph's ``prompts.yaml``.
+    graph's ``prompts.yaml``.  ``summary`` from the same file is the prompt of
+    the summarization model.
     """
 
     name = "deep"
@@ -66,7 +73,13 @@ class DeepAgent(AgentGraph):
         checkpointer: Any,
         history: Optional[List[Any]] = None,
         summary: Optional[str] = None,
-        max_tokens: int = _DEFAULT_MAX_TOKENS,
+        context_window: int = DEFAULT_CONTEXT_WINDOW,
+        summary_trigger_fraction: float = DEFAULT_SUMMARY_TRIGGER_FRACTION,
+        summary_keep_fraction: float = DEFAULT_SUMMARY_KEEP_FRACTION,
+        summary_max_tokens: int = DEFAULT_SUMMARY_MAX_TOKENS,
+        truncate_args_max_chars: int = DEFAULT_TRUNCATE_ARGS_MAX_CHARS,
+        recall_note: Optional[str] = None,
+        message_id_key: str = DEFAULT_MESSAGE_ID_KEY,
         tool_result_max_tokens: Optional[int] = DEFAULT_TOOL_RESULT_MAX_TOKENS,
         fallback_llm=None,
         llm_run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
@@ -87,14 +100,18 @@ class DeepAgent(AgentGraph):
         :func:`default_backend`.  Skills load only when *skills* is passed.
 
         *llm_idle_timeout* is not enforced here; the provider client's read
-        timeout covers stalled streams.  Each model request is trimmed to
-        *max_tokens* like the ``react`` graph; the deepagents summarization
-        middleware is replaced, so the graph never summarizes history.          A tool
-        result above *tool_result_max_tokens* tiktoken tokens is written to
+        timeout covers stalled streams.  When the prompt reaches
+        *summary_trigger_fraction* of *context_window*, older messages are
+        summarized and the last *summary_keep_fraction* stays verbatim.  The
+        cut does not split a tool call from its results.  ``write_file`` and
+        ``edit_file`` arguments in the older part are shortened first.  The
+        thread keeps every message.  A tool result above
+        *tool_result_max_tokens* tiktoken tokens is written to
         ``/large_tool_results/`` on *backend*, which must keep that path for
         the life of the thread.  ``None`` leaves every result in the thread.
         A subagent's own ``FilesystemMiddleware`` keeps its backend and
         permissions, and still uses this limit.  Human messages stay whole.
+        Subagents get the same summarization middleware.
         """
         if backend is None:
             backend = default_backend()
@@ -102,7 +119,15 @@ class DeepAgent(AgentGraph):
         def eve_middleware(agent: Optional[str] = None):
             return build_eve_middleware(
                 backend=backend,
-                max_tokens=max_tokens,
+                model=llm,
+                context_window=context_window,
+                summary_trigger_fraction=summary_trigger_fraction,
+                summary_keep_fraction=summary_keep_fraction,
+                summary_max_tokens=summary_max_tokens,
+                truncate_args_max_chars=truncate_args_max_chars,
+                recall_note=recall_note,
+                message_id_key=message_id_key,
+                summary_prompt=self.prompts.get("summary"),
                 tool_result_max_tokens=tool_result_max_tokens,
                 fallback_llm=fallback_llm,
                 run_timeout=llm_run_timeout,
