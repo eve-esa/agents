@@ -11,6 +11,7 @@ pytest.importorskip("deepagents")
 
 import deepagents.graph as deepagents_graph  # noqa: E402
 import deepagents.middleware.subagents as deepagents_subagents  # noqa: E402
+from deepagents.backends import StateBackend  # noqa: E402
 from deepagents.middleware.filesystem import (  # noqa: E402
     FilesystemMiddleware,
     FilesystemPermission,
@@ -579,6 +580,62 @@ def test_a_second_summary_keeps_the_start_of_the_first_range() -> None:
     assert extra["eve_summary"] == "second summary"
     assert extra["eve_summary_first_message_id"] == "a"
     assert extra["eve_summary_last_message_id"] in {"c", "d"}
+
+
+def _summarizer_prompt(llm) -> str:
+    """Text the summarization call received: the first recorded call."""
+    first = llm.calls[0]
+    return "\n".join(str(m.content) for m in first)
+
+
+def test_the_summarizer_uses_the_eve_prompt() -> None:
+    llm = _model(ScriptedModel, AIMessage("summary"), AIMessage("ok"))
+    graph = _compile(llm, context_window=_WINDOW)
+    asyncio.run(
+        graph.ainvoke(
+            {
+                "messages": [
+                    HumanMessage("oldfact " * 8_000, additional_kwargs={"eve_message_id": "a"}),
+                    AIMessage("x"),
+                    HumanMessage("q", additional_kwargs={"eve_message_id": "b"}),
+                ]
+            },
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+    prompt = _summarizer_prompt(llm)
+    assert "the Earth Observation assistant of ESA" in prompt
+    assert "## Facts and values" in prompt
+    assert "SESSION INTENT" not in prompt
+    assert "oldfact" in prompt
+
+
+def test_system_messages_are_not_summarized() -> None:
+    llm = _model(ScriptedModel, AIMessage("summary"), AIMessage("ok"))
+    graph = _compile(llm, context_window=_WINDOW)
+    asyncio.run(
+        graph.ainvoke(
+            {
+                "messages": [
+                    SystemMessage("RULE-ZX9: always cite sources."),
+                    HumanMessage("oldfact " * 8_000, additional_kwargs={"eve_message_id": "a"}),
+                    AIMessage("x"),
+                    HumanMessage("q", additional_kwargs={"eve_message_id": "b"}),
+                ]
+            },
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+    prompt = _summarizer_prompt(llm)
+    assert "oldfact" in prompt
+    assert "RULE-ZX9" not in prompt
+
+
+def test_a_prompt_without_the_messages_slot_is_refused() -> None:
+    with pytest.raises(ValueError):
+        EveSummarizationMiddleware(
+            _model(), StateBackend(), context_window=_WINDOW, summary_prompt="no slot"
+        )
 
 
 def test_old_write_file_args_are_cut_before_summarizing() -> None:

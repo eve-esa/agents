@@ -53,7 +53,8 @@ class DeepAgent(AgentGraph):
     every declarative subagent, including ``general-purpose``.
 
     The system prompt is the ``react`` prompt followed by ``addendum`` from this
-    graph's ``prompts.yaml``.
+    graph's ``prompts.yaml``.  ``summary`` from the same file is the prompt of
+    the summarization model.
     """
 
     name = "deep"
@@ -126,6 +127,7 @@ class DeepAgent(AgentGraph):
                 truncate_args_max_chars=truncate_args_max_chars,
                 recall_note=recall_note,
                 message_id_key=message_id_key,
+                summary_prompt=self.prompts.get("summary"),
                 tool_result_max_tokens=tool_result_max_tokens,
                 fallback_llm=fallback_llm,
                 run_timeout=llm_run_timeout,

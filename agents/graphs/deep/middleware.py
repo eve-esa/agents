@@ -373,8 +373,12 @@ class EveSummarizationMiddleware(SummarizationMiddleware):
 
     The summary message names the ``message_id_key`` values of the first and
     last summarized human message.  When ``recall_note`` is set it is appended
-    and the ``/conversation_history/`` path is left out: that file lives on
-    the sandbox, which does not outlive the session.
+    and the ``/conversation_history/`` path is left out: that file lives only
+    as long as the thread.
+
+    ``summary_prompt`` replaces the deepagents prompt; it must contain
+    ``{messages}``.  System messages in the older part are not sent to the
+    summarizer, so a summary never restates an instruction.
     """
 
     def __init__(
@@ -389,10 +393,17 @@ class EveSummarizationMiddleware(SummarizationMiddleware):
         truncate_args_max_chars: int = DEFAULT_TRUNCATE_ARGS_MAX_CHARS,
         recall_note: Optional[str] = None,
         message_id_key: str = DEFAULT_MESSAGE_ID_KEY,
+        summary_prompt: Optional[str] = None,
     ) -> None:
         trigger = ("tokens", _token_budget(context_window, summary_trigger_fraction))
         keep = ("tokens", _token_budget(context_window, summary_keep_fraction))
+        prompt_kwargs: dict = {}
+        if summary_prompt:
+            if "{messages}" not in summary_prompt:
+                raise ValueError("summary_prompt must contain {messages}.")
+            prompt_kwargs["summary_prompt"] = summary_prompt
         super().__init__(
+            **prompt_kwargs,
             model=_capped_summarizer(model, summary_max_tokens),
             backend=backend,
             trigger=trigger,
@@ -418,9 +429,12 @@ class EveSummarizationMiddleware(SummarizationMiddleware):
     def _partition_messages(
         self, conversation_messages: List[Any], cutoff_index: int
     ) -> tuple:
-        parts = super()._partition_messages(conversation_messages, cutoff_index)
-        _summarized_messages.set(list(parts[0]))
-        return parts
+        to_summarize, preserved = super()._partition_messages(
+            conversation_messages, cutoff_index
+        )
+        to_summarize = [m for m in to_summarize if not isinstance(m, SystemMessage)]
+        _summarized_messages.set(list(to_summarize))
+        return to_summarize, preserved
 
     def _covered_ids(self, messages: Optional[List[Any]]) -> List[str]:
         """``message_id_key`` values of the summarized human messages.
@@ -457,8 +471,8 @@ class EveSummarizationMiddleware(SummarizationMiddleware):
     ) -> List[Any]:
         ids = self._covered_ids(_summarized_messages.get())
         range_line = self._id_range_line(ids)
-        # The history file is on the sandbox.  A recall note points at the
-        # stored messages instead, which outlive that sandbox.
+        # The history file lives only as long as the thread.  A recall note
+        # points at the stored messages instead, which outlive it.
         if self._recall_note:
             file_path = None
         lines = ["You are in the middle of a conversation that has been summarized."]
@@ -634,6 +648,7 @@ def build_eve_middleware(
     truncate_args_max_chars: int = DEFAULT_TRUNCATE_ARGS_MAX_CHARS,
     recall_note: Optional[str] = None,
     message_id_key: str = DEFAULT_MESSAGE_ID_KEY,
+    summary_prompt: Optional[str] = None,
     tool_result_max_tokens: Optional[int] = DEFAULT_TOOL_RESULT_MAX_TOKENS,
     fallback_llm: Optional[BaseChatModel] = None,
     run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
@@ -661,6 +676,7 @@ def build_eve_middleware(
             truncate_args_max_chars=truncate_args_max_chars,
             recall_note=recall_note,
             message_id_key=message_id_key,
+            summary_prompt=summary_prompt,
         ),
         EveFallbackMiddleware(*fallbacks, on_policy=on_policy, agent=agent),
         EveRetryMiddleware(
