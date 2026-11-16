@@ -59,9 +59,10 @@ from ..policies import (
     mark_fallback,
 )
 from ..utils import (
+    answer_dangling_tool_calls,
     clock_context,
+    normalize_tool_call_ids,
     parse_text_tool_calls,
-    reformat_messages_for_text_tool_model,
     strip_content_from_tool_call_messages,
     tiktoken_counter,
 )
@@ -246,24 +247,22 @@ class EveCompatMiddleware(AgentMiddleware):
 
     - Puts ``clock_context()`` before the system prompt on every call.
     - Strips text from assistant messages that also carry tool calls
-      (Mistral rejects both), and rewrites tool history as text once any tool
-      call is present.
+      (Mistral rejects both). Tool history stays structured: a call without
+      a result gets an error result (Mistral rejects it otherwise), and tool
+      call ids get the 9-character shape JSC accepts.
     - Drops ``AIMessage.name`` on the request. ``create_deep_agent(name="deep")``
       stores that name, and Mistral rejects it on an assistant message.
     - Parses ``[TOOL_CALLS]`` text output into real tool calls.
     """
 
     def _prepare(self, request: ModelRequest) -> ModelRequest:
-        messages = _without_assistant_name(
-            strip_content_from_tool_call_messages(list(request.messages))
+        messages = normalize_tool_call_ids(
+            answer_dangling_tool_calls(
+                _without_assistant_name(
+                    strip_content_from_tool_call_messages(list(request.messages))
+                )
+            )
         )
-        has_tool_history = any(
-            (isinstance(m, AIMessage) and not m.content and getattr(m, "tool_calls", None))
-            or isinstance(m, ToolMessage)
-            for m in messages
-        )
-        if has_tool_history:
-            messages = reformat_messages_for_text_tool_model(messages)
         return request.override(
             system_message=_with_clock(request.system_message),
             messages=messages,

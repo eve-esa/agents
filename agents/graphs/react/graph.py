@@ -1,4 +1,4 @@
-"""ReAct agent graph — manual tool-calling loop via LangGraph StateGraph.
+"""ReAct agent graph: manual tool-calling loop via LangGraph StateGraph.
 
 Uses shared utilities from the parent ``graphs`` package (``utils``) for
 text-format tool-call parsing and message sanitisation.  Imports are
@@ -12,7 +12,6 @@ from typing import Any, List, Literal, Optional
 from langchain_core.messages import (
     AIMessage,
     SystemMessage,
-    ToolMessage,
     trim_messages,
 )
 from langchain_core.tools import BaseTool
@@ -29,9 +28,10 @@ from ..policies import (
     mark_fallback,
 )
 from ..utils import (
+    answer_dangling_tool_calls,
     clock_context,
+    normalize_tool_call_ids,
     parse_text_tool_calls,
-    reformat_messages_for_text_tool_model,
     strip_content_from_tool_call_messages,
     tiktoken_counter,
 )
@@ -101,19 +101,14 @@ class ReactAgent(AgentGraph):
                     end_on=("human", "tool"),
                 )
 
-            messages = strip_content_from_tool_call_messages(messages)
-
-            has_synthetic = any(
-                (
-                    isinstance(m, AIMessage)
-                    and not m.content
-                    and getattr(m, "tool_calls", None)
+            # Tool history stays structured (assistant tool_calls plus tool
+            # messages): the provider renders it in the model's own format.
+            # Calls without a result get one, ids get the shape JSC accepts.
+            messages = normalize_tool_call_ids(
+                answer_dangling_tool_calls(
+                    strip_content_from_tool_call_messages(messages)
                 )
-                or isinstance(m, ToolMessage)
-                for m in messages
             )
-            if has_synthetic:
-                messages = reformat_messages_for_text_tool_model(messages)
 
             response = await llm_bound.ainvoke(messages)
 

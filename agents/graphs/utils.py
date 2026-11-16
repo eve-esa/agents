@@ -1,14 +1,17 @@
-"""Shared utilities for agent graphs — no backend dependencies.
+"""Shared utilities for agent graphs, no backend dependencies.
 
 Contains the clock prompt section, text-format tool-call parsing
-(Mistral/EVE-Instruct), message reformatting and token counting.
+(Mistral/EVE-Instruct), tool call id normalisation, message clean-up and
+token counting.
 
 Only depends on standard library + langchain-core.
 Safe to import from standalone scripts/notebooks.
 """
 
+import hashlib
 import json
 import re
+import string
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -39,111 +42,267 @@ def clock_context(now: Optional[datetime] = None) -> str:
 
 # ─── Text-format tool-call parsing (Mistral / EVE-Instruct) ───────────────────
 
+_ARGS_MARKER = "[ARGS]"
+_TOOL_NAME = re.compile(r"[A-Za-z_][\w-]*")
+
+
+def _call_args(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Arguments under ``arguments`` or ``args``; a string is one more JSON object."""
+    args = item.get("arguments", item.get("args", {}))
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            return {}
+    return args if isinstance(args, dict) else {}
+
+
+def _relax_json_escapes(text: str) -> tuple[str, List[int]]:
+    """Keep valid JSON escapes and double the rest.
+
+    A shell command such as ``\\(`` is not a JSON escape, and ``json.loads``
+    would reject the whole call. Also returns where a backslash was inserted.
+    """
+    inserted: List[int] = []
+
+    def _escape(match: "re.Match[str]") -> str:
+        if match.group(1) in '"\\/bfnrtu':
+            return match.group(0)
+        inserted.append(match.start())
+        return "\\\\" + match.group(1)
+
+    return re.sub(r"\\(.)", _escape, text), inserted
+
+
+def _decode_json_value(text: str) -> tuple[Any, int]:
+    """Decode the JSON value at the start of *text*; return it and its end in *text*."""
+    try:
+        return json.JSONDecoder().raw_decode(text)
+    except json.JSONDecodeError:
+        repaired, inserted = _relax_json_escapes(text)
+        if not inserted:
+            raise
+        value, end = json.JSONDecoder().raw_decode(repaired)
+        shift = sum(1 for k, pos in enumerate(inserted) if pos + k < end)
+        return value, end - shift
+
+
+def _tool_call(index: int, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    return {"id": f"call_{index}_{name}", "name": name, "args": args, "type": "tool_call"}
+
+
+def _json_array_calls(text: str) -> Optional[tuple[List[Dict[str, str]], int]]:
+    """``[{"name": ..., "arguments": {...}}, ...]`` at the start of *text*.
+
+    Mistral tokenizer V2/V3 form. Returns the calls and the end offset, or
+    ``None`` when *text* does not start with such an array.
+    """
+    if not text.startswith("["):
+        return None
+    try:
+        payload, end = _decode_json_value(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, list) or not payload:
+        return None
+    calls = []
+    for item in payload:
+        if not isinstance(item, dict):
+            return None
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            return None
+        calls.append({"name": name, "args": _call_args(item)})
+    return calls, end
+
+
+def _named_call(text: str) -> Optional[tuple[Dict[str, Any], int]]:
+    """``name{...}`` or ``name[ARGS]{...}`` at the start of *text*.
+
+    The arguments object is required, so a word after the marker in prose is
+    not taken for a call.
+    """
+    match = _TOOL_NAME.match(text)
+    if not match:
+        return None
+    i = match.end()
+    while i < len(text) and text[i] in " \t":
+        i += 1
+    if text.startswith(_ARGS_MARKER, i):
+        i += len(_ARGS_MARKER)
+        while i < len(text) and text[i] in " \t":
+            i += 1
+    if not text.startswith("{", i):
+        return None
+    try:
+        args, length = _decode_json_value(text[i:])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(args, dict):
+        return None
+    return {"name": match.group(0), "args": args}, i + length
+
 
 def parse_text_tool_calls(content: str) -> List[Dict[str, Any]]:
-    """Parse ``[TOOL_CALLS]tool_name{"key": "val"} ...`` into structured dicts.
+    """Parse ``[TOOL_CALLS]`` text into structured tool calls.
 
-    Returns a list compatible with ``AIMessage.tool_calls``.
+    Fallback for a model reply that carries its tool calls as text instead of
+    structured ``tool_calls``. Reads the three Mistral forms, several calls
+    each:
+
+    - ``[TOOL_CALLS]name{...}``: the Small 3.2 form with ``[ARGS]`` dropped on
+      decode;
+    - ``[TOOL_CALLS]name[ARGS]{...}``: the Small 3.2 form, one marker per call;
+    - ``[TOOL_CALLS] [{"name": ..., "arguments": {...}}]``: tokenizer V2/V3.
+
+    Parsing stops at the first text that is none of these. Returns ``[]`` when
+    no call parses, so prose that mentions the marker is left alone. Ids are
+    ``call_<n>_<name>``, counted per reply. Returns a list compatible with
+    ``AIMessage.tool_calls``.
     """
     if _TEXT_TOOL_CALL_MARKER not in content:
         return []
 
-    text = content[
-        content.index(_TEXT_TOOL_CALL_MARKER) + len(_TEXT_TOOL_CALL_MARKER) :
-    ].strip()
-    calls: List[Dict[str, Any]] = []
+    text = content[content.index(_TEXT_TOOL_CALL_MARKER) :]
+    found: List[Dict[str, Any]] = []
     i = 0
     while i < len(text):
         while i < len(text) and text[i] in " \t\n,":
             i += 1
-        if i >= len(text):
+        if text.startswith(_TEXT_TOOL_CALL_MARKER, i):
+            i += len(_TEXT_TOOL_CALL_MARKER)
+            while i < len(text) and text[i] in " \t\n":
+                i += 1
+        array = _json_array_calls(text[i:])
+        if array is not None:
+            found.extend(array[0])
+            i += array[1]
+            continue
+        named = _named_call(text[i:])
+        if named is None:
             break
-        m = re.match(r"([A-Za-z_]\w*)", text[i:])
-        if not m:
-            break
-        name = m.group(1)
-        i += m.end()
-        while i < len(text) and text[i] in " \t":
-            i += 1
-        if i < len(text) and text[i] == "{":
-            depth, j = 0, i
-            while j < len(text):
-                if text[j] == "{":
-                    depth += 1
-                elif text[j] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        try:
-                            args = json.loads(text[i : j + 1])
-                        except Exception:
-                            args = {}
-                        calls.append(
-                            {
-                                "id": f"call_{len(calls)}_{name}",
-                                "name": name,
-                                "args": args,
-                                "type": "tool_call",
-                            }
-                        )
-                        i = j + 1
-                        break
-                j += 1
-            else:
-                break
-        else:
-            calls.append(
-                {
-                    "id": f"call_{len(calls)}_{name}",
-                    "name": name,
-                    "args": {},
-                    "type": "tool_call",
-                }
-            )
-    return calls
+        found.append(named[0])
+        i += named[1]
+    return [_tool_call(n, call["name"], call["args"]) for n, call in enumerate(found)]
 
 
 # ─── Message history sanitisation ─────────────────────────────────────────────
 
+# JSC serves EVE-Instruct on vLLM with the Mistral tokenizer: it keeps the last
+# 9 characters of a longer tool call id and answers 400 "Tool call id was ...
+# but must be a-z, A-Z, 0-9, with a length of 9" for anything else.
+_PROVIDER_TOOL_CALL_ID = re.compile(r"[A-Za-z0-9]{9}")
+_ID_ALPHABET = string.ascii_letters + string.digits
 
-def reformat_messages_for_text_tool_model(
+
+def _provider_tool_call_id(seed: str) -> str:
+    number = int.from_bytes(hashlib.sha256(seed.encode()).digest()[:8], "big")
+    chars = []
+    for _ in range(9):
+        number, rest = divmod(number, len(_ID_ALPHABET))
+        chars.append(_ID_ALPHABET[rest])
+    return "".join(chars)
+
+
+def normalize_tool_call_ids(
     messages: List[Any],
     *,
     AIMessage: Any = None,
     ToolMessage: Any = None,
-    HumanMessage: Any = None,
 ) -> List[Any]:
-    """Convert structured tool_calls/ToolMessages back to plain-text format.
+    """Give every tool call id the ``[A-Za-z0-9]{9}`` shape all providers accept.
 
-    Pass LangChain message classes explicitly if calling from a context where
-    they may not be installed, or leave as None to auto-import.
+    Ids from a provider reply already have it and are kept. Ids minted by
+    :func:`parse_text_tool_calls` (``call_<n>_<name>``) do not, and repeat
+    across replies, so each occurrence gets its own id derived from the
+    original and its position; a tool result takes the id of the call before
+    it. Returns new messages for the model request; *messages* is unchanged.
     """
-    if AIMessage is None or ToolMessage is None or HumanMessage is None:
-        from langchain_core.messages import (
-            AIMessage as _AI,
-            HumanMessage as _H,
-            ToolMessage as _T,
-        )
+    if AIMessage is None or ToolMessage is None:
+        from langchain_core.messages import AIMessage as _AI, ToolMessage as _T
 
         AIMessage = AIMessage or _AI
         ToolMessage = ToolMessage or _T
-        HumanMessage = HumanMessage or _H
+
+    seen: Dict[str, int] = {}
+    current: Dict[str, str] = {}
+
+    def _renamed(call_id: Optional[str]) -> Optional[str]:
+        if not call_id or _PROVIDER_TOOL_CALL_ID.fullmatch(call_id):
+            return call_id
+        occurrence = seen.get(call_id, 0)
+        seen[call_id] = occurrence + 1
+        current[call_id] = _provider_tool_call_id(f"{call_id}#{occurrence}")
+        return current[call_id]
 
     result: List[Any] = []
     for msg in messages:
-        if (
-            isinstance(msg, AIMessage)
-            and not msg.content
-            and getattr(msg, "tool_calls", None)
-        ):
-            calls = [
-                {"name": tc["name"], "arguments": tc.get("args", {})}
-                for tc in msg.tool_calls
+        if isinstance(msg, AIMessage) and (msg.tool_calls or msg.invalid_tool_calls):
+            tool_calls = [{**tc, "id": _renamed(tc.get("id"))} for tc in msg.tool_calls]
+            invalid = [
+                {**tc, "id": _renamed(tc.get("id"))} for tc in msg.invalid_tool_calls
             ]
-            result.append(AIMessage(content=f"[TOOL_CALLS] {json.dumps(calls)}"))
+            if tool_calls != msg.tool_calls or invalid != msg.invalid_tool_calls:
+                msg = msg.model_copy(
+                    update={"tool_calls": tool_calls, "invalid_tool_calls": invalid}
+                )
         elif isinstance(msg, ToolMessage):
-            result.append(HumanMessage(content=f"[TOOL_RESULTS]\n{msg.content}"))
-        else:
+            call_id = msg.tool_call_id
+            if call_id and not _PROVIDER_TOOL_CALL_ID.fullmatch(call_id):
+                new_id = current.get(call_id) or _provider_tool_call_id(f"{call_id}#0")
+                msg = msg.model_copy(update={"tool_call_id": new_id})
+        result.append(msg)
+    return result
+
+
+def answer_dangling_tool_calls(
+    messages: List[Any],
+    *,
+    AIMessage: Any = None,
+    ToolMessage: Any = None,
+) -> List[Any]:
+    """Add an error tool result for every call that has none.
+
+    A Stop or a failure during a tool leaves a call without a result in the
+    thread. Mistral answers 400 "Not the same number of function calls and
+    responses" for such history. The result goes after the results the call
+    did get. Returns new messages for the model request; *messages* is
+    unchanged.
+    """
+    if AIMessage is None or ToolMessage is None:
+        from langchain_core.messages import AIMessage as _AI, ToolMessage as _T
+
+        AIMessage = AIMessage or _AI
+        ToolMessage = ToolMessage or _T
+
+    result: List[Any] = []
+    pending: List[Dict[str, Any]] = []
+
+    def _close() -> None:
+        for call in pending:
+            name = call.get("name") or "unknown"
+            result.append(
+                ToolMessage(
+                    content=f"Tool call {name} did not complete: no result was recorded.",
+                    tool_call_id=call["id"],
+                    name=name,
+                    status="error",
+                )
+            )
+        pending.clear()
+
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            pending[:] = [c for c in pending if c["id"] != msg.tool_call_id]
             result.append(msg)
+            continue
+        _close()
+        result.append(msg)
+        if isinstance(msg, AIMessage):
+            pending.extend(
+                c for c in (*msg.tool_calls, *msg.invalid_tool_calls) if c.get("id")
+            )
+    _close()
     return result
 
 
