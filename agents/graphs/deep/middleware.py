@@ -59,12 +59,14 @@ from ..policies import (
     mark_fallback,
 )
 from ..utils import (
-    answer_dangling_tool_calls,
+    MALFORMED_TOOL_CALL_ANSWER,
+    MALFORMED_TOOL_CALL_RETRIES,
     clock_context,
-    normalize_tool_call_ids,
-    parse_text_tool_calls,
-    strip_content_from_tool_call_messages,
+    malformed_reply_errors,
+    prepare_model_messages,
+    structure_model_reply,
     tiktoken_counter,
+    tool_names,
 )
 
 logger = logging.getLogger(__name__)
@@ -246,52 +248,68 @@ class EveCompatMiddleware(AgentMiddleware):
     """Keep ``ReactAgent`` request and response handling.
 
     - Puts ``clock_context()`` before the system prompt on every call.
-    - Strips text from assistant messages that also carry tool calls
-      (Mistral rejects both). Tool history stays structured: a call without
-      a result gets an error result (Mistral rejects it otherwise), and tool
+    - Tool history stays structured on the request copy: old ``[TOOL_CALLS]``
+      text becomes structured calls, every call gets exactly one result
+      (Mistral rejects it otherwise), invalid calls go out as structured
+      calls, text next to calls is cleared (Mistral rejects both) and tool
       call ids get the 9-character shape JSC accepts.
     - Drops ``AIMessage.name`` on the request. ``create_deep_agent(name="deep")``
       stores that name, and Mistral rejects it on an assistant message.
-    - Parses ``[TOOL_CALLS]`` text output into real tool calls.
+    - Reads ``[TOOL_CALLS]`` text and repairable malformed arguments into real
+      tool calls. A reply whose only calls stay malformed is answered with an
+      error result and the model is called again, up to
+      ``MALFORMED_TOOL_CALL_RETRIES`` times, so the turn never ends empty.
     """
 
-    def _prepare(self, request: ModelRequest) -> ModelRequest:
-        messages = normalize_tool_call_ids(
-            answer_dangling_tool_calls(
-                _without_assistant_name(
-                    strip_content_from_tool_call_messages(list(request.messages))
-                )
-            )
+    def _prepare(
+        self, request: ModelRequest, produced: Sequence[Any] = ()
+    ) -> ModelRequest:
+        names = tool_names(request.tools)
+        messages = _without_assistant_name(
+            prepare_model_messages([*request.messages, *produced], names)
         )
         return request.override(
             system_message=_with_clock(request.system_message),
             messages=messages,
         )
 
-    def _parse(self, response: ModelResponse) -> ModelResponse:
+    def _parse(
+        self, request: ModelRequest, response: ModelResponse
+    ) -> tuple[ModelResponse, Optional[List[Any]]]:
+        """Structure the reply; also return error results when it must retry."""
+        names = tool_names(request.tools)
         result: List[Any] = []
+        errors: Optional[List[Any]] = None
         for message in response.result:
-            if (
-                isinstance(message, AIMessage)
-                and not message.tool_calls
-                and isinstance(message.content, str)
-            ):
-                parsed = parse_text_tool_calls(message.content)
-                if parsed:
+            if isinstance(message, AIMessage):
+                structured = structure_model_reply(message, names)
+                if structured is not message and not message.tool_calls:
                     logger.info(
-                        "Parsed %d text-format tool call(s) from model response",
-                        len(parsed),
+                        "Structured %d tool call(s) from a text or malformed reply",
+                        len(structured.tool_calls),
                     )
-                    message = AIMessage(
-                        content="",
-                        tool_calls=parsed,
-                        id=message.id,
-                        response_metadata=message.response_metadata,
-                        usage_metadata=message.usage_metadata,
-                    )
+                message = structured
+                errors = malformed_reply_errors(message)
             result.append(message)
+        if errors:
+            logger.warning(
+                "Model sent %d tool call(s) with malformed arguments", len(errors)
+            )
+        return (
+            ModelResponse(
+                result=result, structured_response=response.structured_response
+            ),
+            errors,
+        )
+
+    @staticmethod
+    def _combine(
+        responses: List[ModelResponse], produced: List[Any], gave_up: bool
+    ) -> ModelResponse:
+        if gave_up:
+            produced = [*produced, AIMessage(content=MALFORMED_TOOL_CALL_ANSWER)]
         return ModelResponse(
-            result=result, structured_response=response.structured_response
+            result=produced, structured_response=responses[-1].structured_response
         )
 
     def wrap_model_call(
@@ -299,14 +317,36 @@ class EveCompatMiddleware(AgentMiddleware):
         request: ModelRequest,
         handler: Callable[[ModelRequest], ModelResponse],
     ) -> ModelResponse:
-        return self._parse(handler(self._prepare(request)))
+        produced: List[Any] = []
+        responses: List[ModelResponse] = []
+        for _ in range(MALFORMED_TOOL_CALL_RETRIES + 1):
+            response, errors = self._parse(
+                request, handler(self._prepare(request, produced))
+            )
+            responses.append(response)
+            produced.extend(response.result)
+            if errors is None:
+                return self._combine(responses, produced, gave_up=False)
+            produced.extend(errors)
+        return self._combine(responses, produced, gave_up=True)
 
     async def awrap_model_call(
         self,
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse:
-        return self._parse(await handler(self._prepare(request)))
+        produced: List[Any] = []
+        responses: List[ModelResponse] = []
+        for _ in range(MALFORMED_TOOL_CALL_RETRIES + 1):
+            response, errors = self._parse(
+                request, await handler(self._prepare(request, produced))
+            )
+            responses.append(response)
+            produced.extend(response.result)
+            if errors is None:
+                return self._combine(responses, produced, gave_up=False)
+            produced.extend(errors)
+        return self._combine(responses, produced, gave_up=True)
 
 
 # The chat models have no ``profile.max_input_tokens``, so the fractions

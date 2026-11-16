@@ -13,7 +13,7 @@ import json
 import re
 import string
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 _TEXT_TOOL_CALL_MARKER = "[TOOL_CALLS]"
 
@@ -143,22 +143,30 @@ def _named_call(text: str) -> Optional[tuple[Dict[str, Any], int]]:
     return {"name": match.group(0), "args": args}, i + length
 
 
-def parse_text_tool_calls(content: str) -> List[Dict[str, Any]]:
+def parse_text_tool_calls(
+    content: str, allowed_names: Optional[Iterable[str]] = None
+) -> List[Dict[str, Any]]:
     """Parse ``[TOOL_CALLS]`` text into structured tool calls.
 
-    Fallback for a model reply that carries its tool calls as text instead of
-    structured ``tool_calls``. Reads the three Mistral forms, several calls
-    each:
+    Public and stable: the backend stream flush reuses it. Fallback for a
+    model reply that carries its tool calls as text instead of structured
+    ``tool_calls``. Accepted forms, several calls each, text before the first
+    marker ignored:
 
     - ``[TOOL_CALLS]name{...}``: the Small 3.2 form with ``[ARGS]`` dropped on
       decode;
     - ``[TOOL_CALLS]name[ARGS]{...}``: the Small 3.2 form, one marker per call;
-    - ``[TOOL_CALLS] [{"name": ..., "arguments": {...}}]``: tokenizer V2/V3.
+    - ``[TOOL_CALLS] [{"name": ..., "arguments": {...}}]``: tokenizer V2/V3
+      (``args`` for ``arguments``, or arguments as a JSON string, also read).
 
-    Parsing stops at the first text that is none of these. Returns ``[]`` when
-    no call parses, so prose that mentions the marker is left alone. Ids are
-    ``call_<n>_<name>``, counted per reply. Returns a list compatible with
-    ``AIMessage.tool_calls``.
+    Arguments are one JSON object; a backslash that is not a JSON escape (a
+    shell ``\\(``) is kept as a literal backslash. A bare name without an
+    object is not a call. Parsing stops at the first text that is none of
+    these. With *allowed_names*, a call to any other name is dropped, so
+    prose such as ``the [TOOL_CALLS] token {...}`` is not a call. Returns
+    ``[]`` when no call parses. Ids are ``call_<n>_<name>``, counted per
+    reply. The list is compatible with ``AIMessage.tool_calls``. Test vectors:
+    :data:`agents.graphs.text_tool_call_vectors.TEXT_TOOL_CALL_VECTORS`.
     """
     if _TEXT_TOOL_CALL_MARKER not in content:
         return []
@@ -183,7 +191,47 @@ def parse_text_tool_calls(content: str) -> List[Dict[str, Any]]:
             break
         found.append(named[0])
         i += named[1]
+    if allowed_names is not None:
+        allowed = set(allowed_names)
+        found = [call for call in found if call["name"] in allowed]
     return [_tool_call(n, call["name"], call["args"]) for n, call in enumerate(found)]
+
+
+def repair_tool_arguments(raw: Any) -> Optional[Dict[str, Any]]:
+    """Arguments of a structured call as a dict, or ``None`` when malformed.
+
+    Applies the escape repair of :func:`parse_text_tool_calls`, so a shell
+    ``\\(`` that made the provider's JSON invalid is read back. Empty
+    arguments are ``{}``.
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text:
+        return {}
+    try:
+        value, end = _decode_json_value(text)
+    except json.JSONDecodeError:
+        return None
+    if text[end:].strip() or not isinstance(value, dict):
+        return None
+    return value
+
+
+def tool_names(tools: Iterable[Any]) -> set:
+    """Names of bound tools: ``BaseTool`` objects or OpenAI tool dicts."""
+    names = set()
+    for item in tools or ():
+        name = getattr(item, "name", None)
+        if name is None and isinstance(item, dict):
+            name = item.get("name") or (item.get("function") or {}).get("name")
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
 
 
 # ─── Message history sanitisation ─────────────────────────────────────────────
@@ -255,19 +303,122 @@ def normalize_tool_call_ids(
     return result
 
 
+MALFORMED_TOOL_CALL_RETRIES = 2
+"""Extra model calls when a reply holds only calls with malformed arguments."""
+
+MALFORMED_TOOL_CALL_ANSWER = (
+    "I could not run the tool: the arguments of my tool call were malformed "
+    "several times. Please try again or rephrase the request."
+)
+
+
+def _malformed_text(name: str) -> str:
+    return (
+        f"Tool call {name} was not run: its arguments were malformed (not valid "
+        "JSON). Call the tool again with the arguments as one valid JSON object."
+    )
+
+
+def malformed_tool_call_results(
+    calls: List[Dict[str, Any]], *, ToolMessage: Any = None
+) -> List[Any]:
+    """One error tool result per invalid call, telling the model why."""
+    if ToolMessage is None:
+        from langchain_core.messages import ToolMessage
+
+    results = []
+    for call in calls:
+        name = call.get("name") or "unknown"
+        results.append(
+            ToolMessage(
+                content=_malformed_text(name),
+                tool_call_id=call.get("id") or "",
+                name=name,
+                status="error",
+            )
+        )
+    return results
+
+
+def malformed_reply_errors(message: Any) -> Optional[List[Any]]:
+    """Error results when *message* has malformed calls and no runnable one.
+
+    ``None`` otherwise. The caller appends the reply and these results and
+    calls the model again, up to :data:`MALFORMED_TOOL_CALL_RETRIES` times.
+    """
+    if getattr(message, "tool_calls", None) or not getattr(
+        message, "invalid_tool_calls", None
+    ):
+        return None
+    return malformed_tool_call_results(message.invalid_tool_calls)
+
+
+def structure_model_reply(
+    message: Any,
+    allowed_names: Optional[Iterable[str]] = None,
+    *,
+    AIMessage: Any = None,
+) -> Any:
+    """Give a model reply structured ``tool_calls`` wherever they can be read.
+
+    An invalid structured call whose arguments the escape repair reads is
+    promoted to ``tool_calls`` with its id. A reply with no call at all is
+    parsed for ``[TOOL_CALLS]`` text (:func:`parse_text_tool_calls`, limited
+    to *allowed_names*); its text is then cleared. Metadata is kept. Calls
+    that stay malformed stay in ``invalid_tool_calls``.
+    """
+    if AIMessage is None:
+        from langchain_core.messages import AIMessage
+
+    if not isinstance(message, AIMessage):
+        return message
+    promoted: List[Dict[str, Any]] = []
+    remaining: List[Dict[str, Any]] = []
+    for call in message.invalid_tool_calls:
+        name = call.get("name")
+        args = repair_tool_arguments(call.get("args"))
+        if isinstance(name, str) and _TOOL_NAME.fullmatch(name) and args is not None:
+            call_id = call.get("id") or _provider_tool_call_id(
+                f"{name}#{call.get('args')}"
+            )
+            promoted.append(
+                {"id": call_id, "name": name, "args": args, "type": "tool_call"}
+            )
+        else:
+            remaining.append(call)
+    if promoted:
+        return message.model_copy(
+            update={
+                "tool_calls": [*message.tool_calls, *promoted],
+                "invalid_tool_calls": remaining,
+            }
+        )
+    if (
+        not message.tool_calls
+        and not message.invalid_tool_calls
+        and isinstance(message.content, str)
+    ):
+        parsed = parse_text_tool_calls(message.content, allowed_names=allowed_names)
+        if parsed:
+            return message.model_copy(update={"tool_calls": parsed, "content": ""})
+    return message
+
+
 def answer_dangling_tool_calls(
     messages: List[Any],
     *,
     AIMessage: Any = None,
     ToolMessage: Any = None,
 ) -> List[Any]:
-    """Add an error tool result for every call that has none.
+    """Pair every call with exactly one tool result.
 
     A Stop or a failure during a tool leaves a call without a result in the
     thread. Mistral answers 400 "Not the same number of function calls and
-    responses" for such history. The result goes after the results the call
-    did get. Returns new messages for the model request; *messages* is
-    unchanged.
+    responses" for such history. The added error result goes after the
+    results the call did get; an invalid call is told its arguments were
+    malformed. A tool result that answers no pending call (an orphan, a
+    duplicate or a late one) is dropped. Returns new messages for the model
+    request; *messages* is unchanged.
     """
     if AIMessage is None or ToolMessage is None:
         from langchain_core.messages import AIMessage as _AI, ToolMessage as _T
@@ -281,9 +432,14 @@ def answer_dangling_tool_calls(
     def _close() -> None:
         for call in pending:
             name = call.get("name") or "unknown"
+            content = (
+                _malformed_text(name)
+                if call.get("type") == "invalid_tool_call"
+                else f"Tool call {name} did not complete: no result was recorded."
+            )
             result.append(
                 ToolMessage(
-                    content=f"Tool call {name} did not complete: no result was recorded.",
+                    content=content,
                     tool_call_id=call["id"],
                     name=name,
                     status="error",
@@ -293,17 +449,119 @@ def answer_dangling_tool_calls(
 
     for msg in messages:
         if isinstance(msg, ToolMessage):
-            pending[:] = [c for c in pending if c["id"] != msg.tool_call_id]
-            result.append(msg)
+            if any(c["id"] == msg.tool_call_id for c in pending):
+                pending[:] = [c for c in pending if c["id"] != msg.tool_call_id]
+                result.append(msg)
             continue
         _close()
         result.append(msg)
         if isinstance(msg, AIMessage):
             pending.extend(
-                c for c in (*msg.tool_calls, *msg.invalid_tool_calls) if c.get("id")
+                {**c, "type": "tool_call"} for c in msg.tool_calls if c.get("id")
+            )
+            pending.extend(
+                {**c, "type": "invalid_tool_call"}
+                for c in msg.invalid_tool_calls
+                if c.get("id")
             )
     _close()
     return result
+
+
+def structure_text_tool_history(
+    messages: List[Any],
+    allowed_names: Optional[Iterable[str]] = None,
+    *,
+    AIMessage: Any = None,
+) -> List[Any]:
+    """Turn old ``[TOOL_CALLS]`` assistant text into structured calls.
+
+    Threads from before structured history hold replies whose text is a call
+    the graph did not parse. Sent as text, they teach the model that form.
+    A reply that parses becomes structured calls (the results that follow
+    pair by id, a missing one gets an error result later); a reply that
+    starts with the marker and does not parse is dropped. Prose that only
+    mentions the marker is kept. Returns new messages; *messages* is
+    unchanged.
+    """
+    if AIMessage is None:
+        from langchain_core.messages import AIMessage
+
+    result: List[Any] = []
+    for msg in messages:
+        if (
+            isinstance(msg, AIMessage)
+            and not msg.tool_calls
+            and not msg.invalid_tool_calls
+            and isinstance(msg.content, str)
+            and _TEXT_TOOL_CALL_MARKER in msg.content
+        ):
+            parsed = parse_text_tool_calls(msg.content, allowed_names=allowed_names)
+            if parsed:
+                msg = msg.model_copy(update={"tool_calls": parsed, "content": ""})
+            elif msg.content.lstrip().startswith(_TEXT_TOOL_CALL_MARKER):
+                continue
+        result.append(msg)
+    return result
+
+
+def structure_invalid_tool_calls(
+    messages: List[Any],
+    *,
+    AIMessage: Any = None,
+    ToolMessage: Any = None,
+) -> List[Any]:
+    """Send invalid calls in history as structured calls the provider accepts.
+
+    ``langchain_openai`` would send an invalid call with its raw, non-JSON
+    arguments string. On the request copy its arguments become the repaired
+    object, or ``{}``; the error result that answers it says why. A call
+    whose name is not a tool name is dropped with its results, and so is an
+    assistant message left with neither text nor calls.
+    """
+    if AIMessage is None or ToolMessage is None:
+        from langchain_core.messages import AIMessage as _AI, ToolMessage as _T
+
+        AIMessage = AIMessage or _AI
+        ToolMessage = ToolMessage or _T
+
+    dropped: set = set()
+    result: List[Any] = []
+    for msg in messages:
+        if isinstance(msg, ToolMessage) and msg.tool_call_id in dropped:
+            continue
+        if isinstance(msg, AIMessage) and msg.invalid_tool_calls:
+            calls = list(msg.tool_calls)
+            for call in msg.invalid_tool_calls:
+                name = call.get("name")
+                if not (isinstance(name, str) and _TOOL_NAME.fullmatch(name)) or not call.get("id"):
+                    dropped.add(call.get("id"))
+                    continue
+                args = repair_tool_arguments(call.get("args"))
+                calls.append(
+                    {"id": call["id"], "name": name, "args": args or {}, "type": "tool_call"}
+                )
+            if not calls and not msg.content:
+                continue
+            msg = msg.model_copy(update={"tool_calls": calls, "invalid_tool_calls": []})
+        result.append(msg)
+    return result
+
+
+def prepare_model_messages(
+    messages: List[Any], allowed_names: Optional[Iterable[str]] = None
+) -> List[Any]:
+    """The request copy of a thread, in the order each step needs.
+
+    Old text calls become structured, every call gets exactly one result,
+    invalid calls go out as structured calls, text next to calls is cleared
+    and ids get the shape JSC accepts. *messages* is unchanged.
+    """
+    messages = structure_text_tool_history(messages, allowed_names)
+    messages = answer_dangling_tool_calls(messages)
+    messages = structure_invalid_tool_calls(messages)
+    messages = strip_content_from_tool_call_messages(messages)
+    return normalize_tool_call_ids(messages)
 
 
 def strip_content_from_tool_call_messages(
@@ -311,10 +569,11 @@ def strip_content_from_tool_call_messages(
     *,
     AIMessage: Any = None,
 ) -> List[Any]:
-    """Strip text content from AIMessages that also carry tool_calls.
+    """Strip text content from AIMessages that also carry tool calls.
 
     Some APIs (Mistral) reject assistant messages with both non-empty
-    content AND tool_calls.
+    content AND tool_calls. Invalid calls count: ``langchain_openai`` sends
+    them as ``tool_calls`` too. Returns copies; *messages* is unchanged.
     """
     if AIMessage is None:
         from langchain_core.messages import AIMessage as _AI
@@ -322,8 +581,12 @@ def strip_content_from_tool_call_messages(
         AIMessage = _AI
 
     return [
-        AIMessage(content="", tool_calls=m.tool_calls, id=m.id)
-        if (isinstance(m, AIMessage) and m.content and getattr(m, "tool_calls", None))
+        m.model_copy(update={"content": ""})
+        if (
+            isinstance(m, AIMessage)
+            and m.content
+            and (m.tool_calls or m.invalid_tool_calls)
+        )
         else m
         for m in messages
     ]
