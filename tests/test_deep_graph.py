@@ -103,7 +103,20 @@ def test_prompt_is_react_prompt_plus_addendum() -> None:
     react_system = ReactAgent().prompts["system"].strip()
     assert agent.name == "deep"
     assert agent.prompts["system"].startswith(react_system)
-    assert "## Files and Subagents" in agent.prompts["system"]
+    system = agent.prompts["system"]
+    assert "## Files and Shell" in system
+    assert "subagent" not in system.lower()
+    assert "delegation" not in system
+    assert "## Sandbox" in system
+    assert "## Network" in system
+    assert "This sandbox can reach the internet." in system
+    assert "they never replace a tool" not in system
+    assert "## Showing a file" in system
+    assert "There is no display tool. Do not call display." in system
+    assert "When display is in your tool list" not in system
+    assert "/artifacts/{id}/{filename}" in system
+    assert "/large_tool_results/" in system
+    assert "search_history" in system
 
 
 def test_transient_error_retries_then_falls_back_with_marker() -> None:
