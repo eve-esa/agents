@@ -212,8 +212,44 @@ def test_text_tool_calls_are_parsed() -> None:
     assert call.tool_calls[0]["name"] == "ping"
     assert call.tool_calls[0]["args"] == {"x": "1"}
     assert any(isinstance(m, ToolMessage) and m.content == "pong 1" for m in messages)
-    # The second model call sees the tool history in text form.
-    assert not any(isinstance(m, ToolMessage) for m in llm.calls[1])
+    # The second model call sees the tool history as structured messages.
+    sent = llm.calls[1]
+    assert any(isinstance(m, ToolMessage) and m.content == "pong 1" for m in sent)
+    assert not any("[TOOL_CALLS]" in _text(m) for m in sent)
+
+
+def test_history_after_one_and_two_tool_calls_stays_structured() -> None:
+    @tool
+    def add(a: int, b: int) -> int:
+        """Add two numbers."""
+        return a + b
+
+    llm = _model(
+        ScriptedModel,
+        AIMessage(content="", tool_calls=[{"name": "add", "args": {"a": 2, "b": 3}, "id": "AbC123xyZ"}]),
+        # A text call from the model: the parser mints call_0_add.
+        AIMessage('[TOOL_CALLS]add[ARGS]{"a": 5, "b": 4}'),
+        AIMessage("The sum is 9."),
+    )
+    messages = asyncio.run(_run(_compile(llm, tools=[add])))
+
+    assert messages[-1].content == "The sum is 9."
+    assert [m.content for m in messages if isinstance(m, ToolMessage)] == ["5", "9"]
+    for sent, rounds in ((llm.calls[1], 1), (llm.calls[2], 2)):
+        calls = [m for m in sent if isinstance(m, AIMessage) and m.tool_calls]
+        results = [m for m in sent if isinstance(m, ToolMessage)]
+        assert len(calls) == rounds and len(results) == rounds
+        assert sum(isinstance(m, HumanMessage) for m in sent) == 1
+        assert not any("[TOOL_CALLS]" in _text(m) or "[TOOL_RESULTS]" in _text(m) for m in sent)
+        for call, result in zip(calls, results):
+            assert sent.index(result) == sent.index(call) + 1
+            assert result.tool_call_id == call.tool_calls[0]["id"]
+            assert len(result.tool_call_id) == 9 and result.tool_call_id.isalnum()
+    # The provider id is kept; the parser id is replaced on the request only.
+    sent_ids = [m.tool_calls[0]["id"] for m in llm.calls[2] if isinstance(m, AIMessage) and m.tool_calls]
+    assert sent_ids[0] == "AbC123xyZ"
+    assert sent_ids[1] != "call_0_add"
+    assert "call_0_add" in [m.tool_calls[0]["id"] for m in messages if isinstance(m, AIMessage) and m.tool_calls]
 
 
 def test_system_prompt_has_clock() -> None:
@@ -719,13 +755,17 @@ def test_old_write_file_args_are_cut_before_summarizing() -> None:
         )
     )
     assert len(llm.calls) == 1
-    # EveCompat rewrites tool calls as text before the model sees them.
-    body = _joined(llm.calls[0])
-    assert "been summarized" not in body
-    assert "Z" * 80_000 not in body
-    assert "Z" * 20 in body
-    assert "argument truncated" in body
-    assert recent_body in body
+    sent = llm.calls[0]
+    assert "been summarized" not in _joined(sent)
+    old_content, new_content = [
+        m.tool_calls[0]["args"]["content"]
+        for m in sent
+        if isinstance(m, AIMessage) and m.tool_calls
+    ]
+    assert "Z" * 80_000 not in old_content
+    assert "Z" * 20 in old_content
+    assert "argument truncated" in old_content
+    assert new_content == recent_body
 
 
 def test_a_tool_batch_is_not_split() -> None:
@@ -756,9 +796,9 @@ def test_a_tool_batch_is_not_split() -> None:
     assert old not in body
     assert "result-one" in body
     assert "result-two" in body
-    calls = [message for message in llm.calls[-1] if "[TOOL_CALLS]" in _text(message)]
+    calls = [m for m in llm.calls[-1] if isinstance(m, AIMessage) and m.tool_calls]
     assert len(calls) == 1
-    assert _text(calls[0]).count('"name": "search"') == 2
+    assert [c["name"] for c in calls[0].tool_calls] == ["search", "search"]
 
 
 def test_an_offloaded_result_stays_a_stub_in_the_summary_input() -> None:

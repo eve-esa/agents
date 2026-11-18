@@ -1,4 +1,4 @@
-"""ReAct agent graph — manual tool-calling loop via LangGraph StateGraph.
+"""ReAct agent graph: manual tool-calling loop via LangGraph StateGraph.
 
 Uses shared utilities from the parent ``graphs`` package (``utils``) for
 text-format tool-call parsing and message sanitisation.  Imports are
@@ -12,7 +12,6 @@ from typing import Any, List, Literal, Optional
 from langchain_core.messages import (
     AIMessage,
     SystemMessage,
-    ToolMessage,
     trim_messages,
 )
 from langchain_core.tools import BaseTool
@@ -29,11 +28,14 @@ from ..policies import (
     mark_fallback,
 )
 from ..utils import (
+    MALFORMED_TOOL_CALL_ANSWER,
+    MALFORMED_TOOL_CALL_RETRIES,
     clock_context,
-    parse_text_tool_calls,
-    reformat_messages_for_text_tool_model,
-    strip_content_from_tool_call_messages,
+    malformed_reply_errors,
+    prepare_model_messages,
+    structure_model_reply,
     tiktoken_counter,
+    tool_names,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,6 +83,7 @@ class ReactAgent(AgentGraph):
             else fallback_llm
         )
         has_fallback = fallback_llm_bound is not None
+        bound_names = tool_names(tools)
 
         # shared invocation logic
         async def _invoke(state: AgentMessagesState, llm_bound):
@@ -101,38 +104,36 @@ class ReactAgent(AgentGraph):
                     end_on=("human", "tool"),
                 )
 
-            messages = strip_content_from_tool_call_messages(messages)
-
-            has_synthetic = any(
-                (
-                    isinstance(m, AIMessage)
-                    and not m.content
-                    and getattr(m, "tool_calls", None)
+            # Tool history stays structured (assistant tool_calls plus tool
+            # messages): the provider renders it in the model's own format.
+            # Old text calls become structured, every call gets one result,
+            # ids get the shape JSC accepts. A reply whose only calls have
+            # malformed arguments is answered with an error result and the
+            # model tries again, so the turn never ends empty.
+            produced: List[Any] = []
+            for _ in range(MALFORMED_TOOL_CALL_RETRIES + 1):
+                response = await llm_bound.ainvoke(
+                    prepare_model_messages(messages + produced, bound_names)
                 )
-                or isinstance(m, ToolMessage)
-                for m in messages
-            )
-            if has_synthetic:
-                messages = reformat_messages_for_text_tool_model(messages)
-
-            response = await llm_bound.ainvoke(messages)
-
-            if not getattr(response, "tool_calls", None) and isinstance(
-                response.content, str
-            ):
-                parsed = parse_text_tool_calls(response.content)
-                if parsed:
+                structured = structure_model_reply(response, bound_names)
+                if structured is not response and not response.tool_calls:
                     logger.info(
-                        "Parsed %d text-format tool call(s) from model response",
-                        len(parsed),
+                        "Structured %d tool call(s) from a text or malformed reply",
+                        len(structured.tool_calls),
                     )
-                    response = AIMessage(
-                        content="",
-                        tool_calls=parsed,
-                        id=getattr(response, "id", None),
-                    )
+                produced.append(structured)
+                errors = malformed_reply_errors(structured)
+                if errors is None:
+                    break
+                logger.warning(
+                    "Model sent %d tool call(s) with malformed arguments",
+                    len(errors),
+                )
+                produced.extend(errors)
+            else:
+                produced.append(AIMessage(content=MALFORMED_TOOL_CALL_ANSWER))
 
-            return {"messages": [response]}
+            return {"messages": produced}
 
         # primary agent node
         async def agent_fn(state: AgentMessagesState):
