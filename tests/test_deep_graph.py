@@ -16,6 +16,7 @@ from deepagents.middleware.filesystem import (  # noqa: E402
     FilesystemMiddleware,
     FilesystemPermission,
 )
+from langchain_core.exceptions import ModelInvalidRequestError  # noqa: E402
 from langchain_core.language_models.fake_chat_models import (  # noqa: E402
     FakeMessagesListChatModel,
 )
@@ -25,6 +26,7 @@ from langchain_core.messages import (  # noqa: E402
     SystemMessage,
     ToolMessage,
 )
+from langchain_core.outputs import ChatGeneration, ChatResult  # noqa: E402
 from langchain_core.tools import tool  # noqa: E402
 from langgraph.checkpoint.memory import InMemorySaver  # noqa: E402
 
@@ -715,6 +717,156 @@ def test_a_prompt_without_the_messages_slot_is_refused() -> None:
         EveSummarizationMiddleware(
             _model(), StateBackend(), context_window=_WINDOW, summary_prompt="no slot"
         )
+
+
+class ContextOverflow(ModelInvalidRequestError):
+    """The 400 an OpenAI-compatible server (vLLM) returns for a long prompt.
+
+    langchain-openai raises it as ``OpenAIInvalidRequestError``, not as a
+    ``ContextOverflowError``: the text has no ``context_length_exceeded``.
+    """
+
+    status_code = 400
+
+
+class WindowedModel(ScriptedModel):
+    """Rejects a call whose messages hold more than *max_chars* characters.
+
+    A call without a system message is a summary call and answers
+    ``summary-<n>``; the agent call answers ``ok``.
+    """
+
+    max_chars: int = 30_000
+    summaries: int = 0
+
+    async def _agenerate(self, messages, *args, **kwargs):
+        return self._answer(messages)
+
+    def _generate(self, messages, *args, **kwargs):
+        return self._answer(messages)
+
+    def _answer(self, messages):
+        self.calls.append(messages)
+        if len(_joined(messages)) > self.max_chars:
+            raise ContextOverflow(
+                "This model's maximum context length is 131072 tokens."
+            )
+        if messages and isinstance(messages[0], SystemMessage):
+            text = "ok"
+        else:
+            self.summaries += 1
+            text = f"summary-{self.summaries}"
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(text))])
+
+
+def _windowed(max_chars: int) -> WindowedModel:
+    return WindowedModel(responses=[AIMessage("unused")], calls=[], max_chars=max_chars)
+
+
+def _older_part() -> List[Any]:
+    return [
+        HumanMessage("oldfact " * 2_000),
+        AIMessage("old answer"),
+        HumanMessage("newerfact " * 2_000),
+        AIMessage("newer answer"),
+    ]
+
+
+def _accepted_prompts(llm: WindowedModel) -> List[str]:
+    prompts = [_joined(call) for call in llm.calls]
+    return [p for p in prompts if len(p) <= llm.max_chars]
+
+
+def _assert_refined(llm: WindowedModel, summary: str) -> None:
+    accepted = _accepted_prompts(llm)
+    assert len(accepted) == llm.summaries >= 2
+    assert summary == f"summary-{llm.summaries}"
+    assert "Summary of the earlier messages" not in accepted[0]
+    for number, prompt in enumerate(accepted[1:], start=1):
+        assert "Summary of the earlier messages" in prompt
+        assert f"\nsummary-{number}\n" in prompt
+    joined = "\n".join(accepted)
+    # Each cut can split one word; nothing else is lost.
+    assert joined.count("oldfact") >= 1_995
+    assert joined.count("newerfact") >= 1_995
+    assert "newer answer" in accepted[-1]
+
+
+def test_an_overflowing_summary_is_built_in_chunks() -> None:
+    llm = _windowed(30_000)
+    middleware = EveSummarizationMiddleware(llm, StateBackend(), context_window=_WINDOW)
+    summary = asyncio.run(middleware._acreate_summary(_older_part()))
+    assert len(_joined(llm.calls[0])) > llm.max_chars
+    _assert_refined(llm, summary)
+
+
+def test_a_chunk_that_still_overflows_is_halved() -> None:
+    llm = _windowed(14_000)
+    middleware = EveSummarizationMiddleware(llm, StateBackend(), context_window=_WINDOW)
+    summary = asyncio.run(middleware._acreate_summary(_older_part()))
+    rejected = [c for c in llm.calls[1:] if len(_joined(c)) > llm.max_chars]
+    assert rejected
+    _assert_refined(llm, summary)
+
+
+def test_the_sync_summary_is_built_in_chunks_too() -> None:
+    llm = _windowed(30_000)
+    middleware = EveSummarizationMiddleware(llm, StateBackend(), context_window=_WINDOW)
+    _assert_refined(llm, middleware._create_summary(_older_part()))
+
+
+class BadRequest(ModelInvalidRequestError):
+    status_code = 400
+
+
+def test_a_summary_error_that_is_not_an_overflow_is_raised() -> None:
+    error = BadRequest("Unexpected role 'system' after role 'assistant'")
+    llm = _model(FailingModel, error=error)
+    middleware = EveSummarizationMiddleware(llm, StateBackend(), context_window=_WINDOW)
+    with pytest.raises(BadRequest):
+        asyncio.run(middleware._acreate_summary(_older_part()))
+    assert len(llm.calls) == 1
+
+
+def test_chunking_gives_up_when_nothing_fits() -> None:
+    llm = _windowed(100)
+    middleware = EveSummarizationMiddleware(llm, StateBackend(), context_window=_WINDOW)
+    with pytest.raises(ContextOverflow):
+        asyncio.run(middleware._acreate_summary(_older_part()))
+    assert llm.summaries == 0
+    assert len(llm.calls) < 10
+
+
+def test_the_graph_answers_after_a_chunked_summary() -> None:
+    llm = _windowed(60_000)
+    graph = _compile(llm, context_window=_WINDOW)
+    config = {"configurable": {"thread_id": "t"}}
+    out = asyncio.run(
+        graph.ainvoke(
+            {
+                "messages": [
+                    HumanMessage("oldfact " * 8_000, additional_kwargs={"eve_message_id": "a"}),
+                    AIMessage("old answer"),
+                    HumanMessage("newerfact " * 8_000, additional_kwargs={"eve_message_id": "b"}),
+                    AIMessage("newer answer"),
+                    HumanMessage("new question", additional_kwargs={"eve_message_id": "c"}),
+                ]
+            },
+            config,
+        )
+    )
+    assert out["messages"][-1].content == "ok"
+    final = llm.calls[-1]
+    assert isinstance(final[0], SystemMessage)
+    assert f"summary-{llm.summaries}" in _text(final[1])
+    assert "new question" in _joined(final)
+    assert llm.summaries >= 2
+    extra = graph.get_state(config).values["_summarization_event"][
+        "summary_message"
+    ].additional_kwargs
+    assert extra["eve_summary"] == f"summary-{llm.summaries}"
+    assert extra["eve_summary_first_message_id"] == "a"
+    assert extra["eve_summary_last_message_id"] == "b"
 
 
 def test_old_write_file_args_are_cut_before_summarizing() -> None:
