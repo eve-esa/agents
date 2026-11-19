@@ -11,7 +11,7 @@ Requires the ``deep`` extra: ``pip install "eve-esa-agents[deep]"``.
 from __future__ import annotations
 
 import logging
-from typing import Any, List, Optional, Sequence
+from typing import Any, Callable, List, Optional, Sequence
 
 from deepagents import FilesystemPermission, create_deep_agent
 from deepagents.backends import StateBackend
@@ -81,6 +81,7 @@ class DeepAgent(AgentGraph):
         recall_note: Optional[str] = None,
         message_id_key: str = DEFAULT_MESSAGE_ID_KEY,
         tool_result_max_tokens: Optional[int] = DEFAULT_TOOL_RESULT_MAX_TOKENS,
+        token_counter: Optional[Callable] = None,
         fallback_llm=None,
         llm_run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
         llm_idle_timeout: Optional[float] = DEFAULT_LLM_IDLE_TIMEOUT,
@@ -106,7 +107,7 @@ class DeepAgent(AgentGraph):
         cut does not split a tool call from its results.  ``write_file`` and
         ``edit_file`` arguments in the older part are shortened first.  The
         thread keeps every message.  A tool result above
-        *tool_result_max_tokens* tiktoken tokens is written to
+        *tool_result_max_tokens* tokens is written to
         ``/large_tool_results/`` on *backend*, which must keep that path for
         the life of the thread.  ``None`` leaves every result in the thread.
         A subagent's own ``FilesystemMiddleware`` keeps its backend and
@@ -129,6 +130,7 @@ class DeepAgent(AgentGraph):
                 message_id_key=message_id_key,
                 summary_prompt=self.prompts.get("summary"),
                 tool_result_max_tokens=tool_result_max_tokens,
+                token_counter=token_counter,
                 fallback_llm=fallback_llm,
                 run_timeout=llm_run_timeout,
                 on_policy=on_policy,
@@ -142,7 +144,7 @@ class DeepAgent(AgentGraph):
                 for middleware in spec.get("middleware", []):
                     if getattr(middleware, "name", None) == "FilesystemMiddleware":
                         middleware = filesystem_keeping_offload(
-                            middleware, tool_result_max_tokens
+                            middleware, tool_result_max_tokens, token_counter
                         )
                     merged[middleware.name] = middleware
                 spec = {**spec, "middleware": list(merged.values())}

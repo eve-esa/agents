@@ -530,6 +530,7 @@ class EveSummarizationMiddleware(SummarizationMiddleware):
         recall_note: Optional[str] = None,
         message_id_key: str = DEFAULT_MESSAGE_ID_KEY,
         summary_prompt: Optional[str] = None,
+        token_counter: Optional[Callable] = None,
     ) -> None:
         trigger = ("tokens", _token_budget(context_window, summary_trigger_fraction))
         keep = ("tokens", _token_budget(context_window, summary_keep_fraction))
@@ -538,6 +539,10 @@ class EveSummarizationMiddleware(SummarizationMiddleware):
             if "{messages}" not in summary_prompt:
                 raise ValueError("summary_prompt must contain {messages}.")
             prompt_kwargs["summary_prompt"] = summary_prompt
+        # ``None`` keeps the deepagents default, ``count_tokens_approximately``.
+        # A counter must accept ``tools=``: deepagents counts the tool schemas.
+        if token_counter is not None:
+            prompt_kwargs["token_counter"] = token_counter
         super().__init__(
             **prompt_kwargs,
             model=_capped_summarizer(model, summary_max_tokens),
@@ -737,17 +742,23 @@ def tool_error_message(exc: Exception, request: ToolCallRequest) -> str:
 DEFAULT_TOOL_RESULT_MAX_TOKENS = 20_000
 
 
-def _content_tokens(text: str) -> int:
-    """Token count of *text* with the same counter the offload decision uses.
+def _text_tokens(text: str, token_counter: Optional[Callable]) -> int:
+    """Token count of *text* alone, without the per-message overhead.
 
-    :func:`tiktoken_counter` adds 4 per message.  Those are not part of the
-    tool result, so they come back off.
+    Without *token_counter*, :func:`tiktoken_counter` decides.  It adds 4 per
+    message, and those are not part of the tool result.  A passed counter is
+    measured the same way: its count of an empty message comes off.
     """
-    return max(0, tiktoken_counter([HumanMessage(content=text)]) - 4)
+    counter = token_counter or tiktoken_counter
+    message = HumanMessage(content=text)
+    return max(0, counter([message]) - counter([HumanMessage(content="")]))
 
 
 class EveFilesystemMiddleware(FilesystemMiddleware):
-    """``FilesystemMiddleware`` that offloads by :func:`tiktoken_counter`.
+    """``FilesystemMiddleware`` that offloads by a token counter.
+
+    *token_counter*, when passed, is the same counter the summary trigger
+    uses.  Without one, :func:`tiktoken_counter` decides.
 
     deepagents decides from ``len(text) / 4``.  That leaves dense text, such
     as CJK, inline while it is already over the token budget the
@@ -766,12 +777,18 @@ class EveFilesystemMiddleware(FilesystemMiddleware):
     file tools are not applied.
     """
 
-    def __init__(self, backend: Any, tool_result_max_tokens: Optional[int]) -> None:
+    def __init__(
+        self,
+        backend: Any,
+        tool_result_max_tokens: Optional[int],
+        token_counter: Optional[Callable] = None,
+    ) -> None:
         super().__init__(
             backend=backend,
             tool_token_limit_before_evict=tool_result_max_tokens,
             human_message_token_limit_before_evict=None,
         )
+        self._token_counter = token_counter
 
     @property
     def name(self) -> str:
@@ -781,14 +798,14 @@ class EveFilesystemMiddleware(FilesystemMiddleware):
         if not self._tool_token_limit_before_evict:
             return None
         content = _extract_text_from_message(message)
-        if _content_tokens(content) <= self._tool_token_limit_before_evict:
+        if self._text_tokens(content) <= self._tool_token_limit_before_evict:
             return None
         offload = _offload_tool_message_content if sync else _aoffload_tool_message_content
         return offload(message, content, resolved_backend, self._large_tool_results_prefix)
 
     def _process_large_message(self, message: ToolMessage, resolved_backend: Any):
         offloaded = self._offload_over_budget(message, resolved_backend, sync=True)
-        if offloaded is None and _content_tokens(_extract_text_from_message(message)) > (
+        if offloaded is None and self._text_tokens(_extract_text_from_message(message)) > (
             self._tool_token_limit_before_evict or 0
         ):
             return message, False
@@ -800,7 +817,7 @@ class EveFilesystemMiddleware(FilesystemMiddleware):
         offloaded = self._offload_over_budget(message, resolved_backend, sync=False)
         if offloaded is not None:
             offloaded = await offloaded
-        over = _content_tokens(_extract_text_from_message(message)) > (
+        over = self._text_tokens(_extract_text_from_message(message)) > (
             self._tool_token_limit_before_evict or 0
         )
         if offloaded is None and over:
@@ -809,16 +826,23 @@ class EveFilesystemMiddleware(FilesystemMiddleware):
             return offloaded, True
         return await super()._aprocess_large_message(message, resolved_backend)
 
+    def _text_tokens(self, text: str) -> int:
+        return _text_tokens(text, self._token_counter)
+
 
 def offload_filesystem(
-    backend: Any, tool_result_max_tokens: Optional[int]
+    backend: Any,
+    tool_result_max_tokens: Optional[int],
+    token_counter: Optional[Callable] = None,
 ) -> EveFilesystemMiddleware:
     """Filesystem middleware for one agent.  See :class:`EveFilesystemMiddleware`."""
-    return EveFilesystemMiddleware(backend, tool_result_max_tokens)
+    return EveFilesystemMiddleware(backend, tool_result_max_tokens, token_counter)
 
 
 def filesystem_keeping_offload(
-    middleware: Any, tool_result_max_tokens: Optional[int]
+    middleware: Any,
+    tool_result_max_tokens: Optional[int],
+    token_counter: Optional[Callable] = None,
 ) -> FilesystemMiddleware:
     """Keep *middleware*'s backend and permissions, and apply this graph's limit.
 
@@ -831,11 +855,13 @@ def filesystem_keeping_offload(
         isinstance(middleware, EveFilesystemMiddleware)
         and middleware._tool_token_limit_before_evict == tool_result_max_tokens
         and middleware._human_message_token_limit_before_evict is None
+        and getattr(middleware, "_token_counter", None) is token_counter
     ):
         return middleware
     rebuilt = EveFilesystemMiddleware(
         backend=getattr(middleware, "backend", None),
         tool_result_max_tokens=tool_result_max_tokens,
+        token_counter=token_counter,
     )
     permissions = list(getattr(middleware, "_permissions", []) or [])
     if permissions:
@@ -856,6 +882,7 @@ def build_eve_middleware(
     message_id_key: str = DEFAULT_MESSAGE_ID_KEY,
     summary_prompt: Optional[str] = None,
     tool_result_max_tokens: Optional[int] = DEFAULT_TOOL_RESULT_MAX_TOKENS,
+    token_counter: Optional[Callable] = None,
     fallback_llm: Optional[BaseChatModel] = None,
     run_timeout: Optional[float] = DEFAULT_LLM_RUN_TIMEOUT,
     on_policy: PolicyCallback = None,
@@ -871,7 +898,7 @@ def build_eve_middleware(
     """
     fallbacks = [fallback_llm] if fallback_llm is not None else []
     return [
-        offload_filesystem(backend, tool_result_max_tokens),
+        offload_filesystem(backend, tool_result_max_tokens, token_counter),
         EveSummarizationMiddleware(
             model,
             backend,
@@ -883,6 +910,7 @@ def build_eve_middleware(
             recall_note=recall_note,
             message_id_key=message_id_key,
             summary_prompt=summary_prompt,
+            token_counter=token_counter,
         ),
         EveFallbackMiddleware(*fallbacks, on_policy=on_policy, agent=agent),
         EveRetryMiddleware(
