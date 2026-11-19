@@ -7,7 +7,8 @@ to add what the built-ins have no hook for: backend ``on_policy`` events, the
 fallback marker and a per-attempt run cap.  ``EveCompatMiddleware`` keeps the
 ``ReactAgent`` prompt and text-tool-call behaviour, and
 ``EveSummarizationMiddleware`` replaces the deepagents summarization with
-one whose trigger and tail are fractions of a known context window.
+one whose trigger and tail are fractions of a known context window, and which
+summarizes in chunks when one summary call does not fit.
 :func:`offload_filesystem` writes tool results over a tiktoken limit to
 ``/large_tool_results/``.  The same limit is the deepagents character cap on
 one ``read_file`` page.  Human messages stay in the thread.
@@ -25,7 +26,10 @@ from contextvars import ContextVar
 from typing import Any, Awaitable, Callable, List, Optional, Sequence
 
 from deepagents import FilesystemMiddleware
-from deepagents.middleware.summarization import SummarizationMiddleware
+from deepagents.middleware.summarization import (
+    SummarizationMiddleware,
+    _is_context_overflow,
+)
 from deepagents.middleware._message_eviction import (
     _aoffload_tool_message_content,
     _extract_text_from_message,
@@ -403,6 +407,86 @@ def _capped_summarizer(model: BaseChatModel, summary_max_tokens: int) -> BaseCha
     return model.model_copy(update={"max_tokens": summary_max_tokens})
 
 
+# Smallest chunk the chunked summary sends.  Below it the prompt and the
+# running summary take most of any window, so the overflow is raised instead.
+MIN_SUMMARY_CHUNK_TOKENS = 1_000
+# First message of every chunk after the first.  The summary prompt already
+# tells the model that the messages can start with an earlier summary.
+RUNNING_SUMMARY_TEMPLATE = (
+    "Summary of the earlier messages of this conversation:\n\n"
+    "<summary>\n{summary}\n</summary>"
+)
+
+
+def _split_message(message: Any, budget: int, token_counter: Callable) -> tuple:
+    """``(head, tail)`` of *message*, the head about *budget* tokens of its text.
+
+    The tail is ``None`` when the text cannot be cut.  Tool calls stay on the
+    head.  Only the text is kept: the summarizer reads text.
+    """
+    content = message.content
+    text = content if isinstance(content, str) else _extract_text_from_message(message)
+    keep = len(text) * budget // max(token_counter([message]), 1)
+    if not text or keep <= 0 or keep >= len(text):
+        return message, None
+    head = message.model_copy(update={"content": text[:keep]})
+    rest: dict = {"content": text[keep:]}
+    if isinstance(message, AIMessage):
+        rest.update(tool_calls=[], invalid_tool_calls=[])
+    return head, message.model_copy(update=rest)
+
+
+class _ChunkedSummary:
+    """Refine plan for an older part that does not fit one summary call.
+
+    Each step is the running summary, then the next messages that fit the
+    budget.  The first budget is half the token count of the whole part; an
+    overflow halves it and the same chunk is sent again, smaller.  A message
+    over the budget is cut by characters.  Below
+    ``MIN_SUMMARY_CHUNK_TOKENS`` the overflow is raised.
+    """
+
+    def __init__(self, messages: List[Any], token_counter: Callable) -> None:
+        self._count = token_counter
+        self._pending = list(messages)
+        self._rest: List[Any] = []
+        self._budget = max(1, token_counter(self._pending) // 2)
+        self.summary: Optional[str] = None
+
+    def step(self) -> Optional[List[Any]]:
+        """Messages of the next summary call, ``None`` when all are summarized."""
+        if not self._pending:
+            return None
+        chunk, self._rest = self._next_chunk()
+        if self.summary is None:
+            return chunk
+        running = RUNNING_SUMMARY_TEMPLATE.format(summary=self.summary)
+        return [HumanMessage(content=running), *chunk]
+
+    def summarized(self, summary: str) -> None:
+        self.summary = summary
+        self._pending = self._rest
+
+    def overflowed(self, error: Exception) -> None:
+        self._budget //= 2
+        if self._budget < MIN_SUMMARY_CHUNK_TOKENS:
+            raise error
+
+    def _next_chunk(self) -> tuple:
+        used = 0
+        for index, message in enumerate(self._pending):
+            used += self._count([message])
+            if used > self._budget:
+                break
+        else:
+            return list(self._pending), []
+        if index > 0:
+            return self._pending[:index], self._pending[index:]
+        head, tail = _split_message(self._pending[0], self._budget, self._count)
+        rest = self._pending[1:]
+        return [head], ([tail, *rest] if tail is not None else rest)
+
+
 class EveSummarizationMiddleware(SummarizationMiddleware):
     """Summarize older history once the prompt fills most of the window.
 
@@ -421,6 +505,12 @@ class EveSummarizationMiddleware(SummarizationMiddleware):
     ``summary_prompt`` replaces the deepagents prompt; it must contain
     ``{messages}``.  System messages in the older part are not sent to the
     summarizer, so a summary never restates an instruction.
+
+    When the summary call is rejected as over the summarizer's context
+    window, the older part is summarized in chunks instead: each call gets the
+    running summary and the next chunk (see :class:`_ChunkedSummary`).  The
+    trigger counts tokens approximately, and a model with a smaller window can
+    take over a thread, so a single call is not guaranteed to fit.
 
     Around the summary call it writes ``custom`` stream payloads with
     ``event`` set to ``SUMMARY_STREAM_EVENT`` and ``phase`` ``started``, then
@@ -501,16 +591,56 @@ class EveSummarizationMiddleware(SummarizationMiddleware):
     def _create_summary(self, messages_to_summarize: List[Any]) -> str:
         self._write_summary_event("started", messages_to_summarize)
         try:
-            return super()._create_summary(messages_to_summarize)
+            try:
+                return super()._create_summary(messages_to_summarize)
+            except Exception as exc:
+                if not _is_context_overflow(exc):
+                    raise
+                return self._chunked_summary(messages_to_summarize)
         finally:
             self._write_summary_event("finished", messages_to_summarize)
 
     async def _acreate_summary(self, messages_to_summarize: List[Any]) -> str:
         self._write_summary_event("started", messages_to_summarize)
         try:
-            return await super()._acreate_summary(messages_to_summarize)
+            try:
+                return await super()._acreate_summary(messages_to_summarize)
+            except Exception as exc:
+                if not _is_context_overflow(exc):
+                    raise
+                return await self._achunked_summary(messages_to_summarize)
         finally:
             self._write_summary_event("finished", messages_to_summarize)
+
+    def _chunked_summary(self, messages: List[Any]) -> str:
+        logger.warning(
+            "Summary of %d messages overflowed the summarizer; summarizing in chunks",
+            len(messages),
+        )
+        plan = _ChunkedSummary(messages, self.token_counter)
+        while (step := plan.step()) is not None:
+            try:
+                plan.summarized(super()._create_summary(step))
+            except Exception as exc:
+                if not _is_context_overflow(exc):
+                    raise
+                plan.overflowed(exc)
+        return plan.summary or ""
+
+    async def _achunked_summary(self, messages: List[Any]) -> str:
+        logger.warning(
+            "Summary of %d messages overflowed the summarizer; summarizing in chunks",
+            len(messages),
+        )
+        plan = _ChunkedSummary(messages, self.token_counter)
+        while (step := plan.step()) is not None:
+            try:
+                plan.summarized(await super()._acreate_summary(step))
+            except Exception as exc:
+                if not _is_context_overflow(exc):
+                    raise
+                plan.overflowed(exc)
+        return plan.summary or ""
 
     def _covered_ids(self, messages: Optional[List[Any]]) -> List[str]:
         """``message_id_key`` values of the summarized human messages.
