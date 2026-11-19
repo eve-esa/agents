@@ -364,6 +364,80 @@ def test_large_tool_result_is_offloaded() -> None:
     assert out["files"]["/large_tool_results/s1"]["content"] == big
 
 
+def _chars(messages, tools=None) -> int:
+    """One token per character. Accepts ``tools=``, as deepagents requires."""
+    total = 0
+    for message in messages:
+        content = getattr(message, "content", message)
+        total += len(content if isinstance(content, str) else str(content))
+    if tools:
+        total += len(str(tools))
+    return total
+
+
+def test_a_heavier_counter_summarizes_a_history_the_default_keeps() -> None:
+    history = {
+        "messages": [
+            HumanMessage("fact " * 4_000, additional_kwargs={"eve_message_id": "a"}),
+            HumanMessage("new question", additional_kwargs={"eve_message_id": "b"}),
+        ]
+    }
+    config = {"configurable": {"thread_id": "t"}}
+    plain = _model(ScriptedModel, AIMessage("ok"))
+    asyncio.run(_compile(plain).ainvoke(history, config))
+    assert len(plain.calls) == 1
+
+    heavy = _model(ScriptedModel, AIMessage("kept"), AIMessage("ok"))
+
+    def triple(messages, tools=None):
+        from langchain_core.messages.utils import count_tokens_approximately
+
+        return count_tokens_approximately(messages, tools=tools) * 3
+
+    asyncio.run(
+        _compile(heavy, context_window=_WINDOW, token_counter=triple).ainvoke(
+            history, {"configurable": {"thread_id": "t2"}}
+        )
+    )
+    assert len(heavy.calls) == 2
+    assert heavy.calls[1][1].additional_kwargs.get("lc_source") == "summarization"
+
+
+def test_the_offload_limit_uses_the_passed_counter() -> None:
+    """Sixty letters stay under 50 tiktoken tokens and over 50 of a char counter."""
+    text = "a" * 60
+
+    @tool
+    def search(q: str) -> str:
+        """Returns a short result."""
+        return text
+
+    script = [
+        AIMessage(content="", tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "s1"}]),
+        AIMessage("done"),
+    ]
+    kept = _model(ScriptedModel, *script)
+    kept_out = asyncio.run(
+        _compile(kept, tools=[search], tool_result_max_tokens=50).ainvoke(
+            {"messages": [HumanMessage("hi")]}, {"configurable": {"thread_id": "t"}}
+        )
+    )
+    kept_result = next(m for m in kept_out["messages"] if isinstance(m, ToolMessage))
+    assert kept_result.content == text
+
+    counted = _model(ScriptedModel, *script)
+    out = asyncio.run(
+        _compile(
+            counted, tools=[search], tool_result_max_tokens=50, token_counter=_chars
+        ).ainvoke(
+            {"messages": [HumanMessage("hi")]}, {"configurable": {"thread_id": "t2"}}
+        )
+    )
+    result = next(m for m in out["messages"] if isinstance(m, ToolMessage))
+    assert "/large_tool_results/s1" in result.content
+    assert out["files"]["/large_tool_results/s1"]["content"] == text
+
+
 def test_dense_tool_result_is_offloaded_by_tiktoken() -> None:
     """CJK is one token per character. The character estimate would keep this.
 
