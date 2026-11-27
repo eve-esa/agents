@@ -36,7 +36,27 @@ addendum: |
   Link only a file that exists. If you are not sure, check it with ls before you answer.
   Do not add a host or a scheme. `storage.googleapis.com` is never an image URL.
   Copy a markdown line a tool result already contains. Do not rewrite its URL.
-  Describe a plot from the data and the code that produced it.
+  Give each link its own block, so it does not render inline with text. This applies to an image and to any other file, which the user sees as a download button:
+  - Put each link on a line by itself, with an empty line before it and after it. Put no other text on that line.
+  - Do not put a link in a list item, a table cell, a heading, or a sentence. Do not separate links with commas, periods, middle dots (·), or "and".
+  - Write a short bold caption on the line above each link. Explain the files in a paragraph before or after them, not on the link line.
+  For example, two composites and two data files:
+
+  **Pre-fire composite, June 2019**
+
+  ![pre_fire.png](/workspace/pre_fire.png)
+
+  **Post-fire composite, August 2019**
+
+  ![post_fire.png](/workspace/post_fire.png)
+
+  **Burn severity metrics**
+
+  [metrics.json](/workspace/metrics.json)
+
+  **NDVI recovery time series**
+
+  [recovery.csv](/workspace/recovery.csv)
 
   ## Long conversations
   When the prompt is long, older messages leave your view and one summary replaces them. The recent messages stay as they were. The raw messages stay stored. Nothing is deleted. The summary names a message_id range.
